@@ -5,7 +5,7 @@ compatibility_date = "2025-07-20"
 # KV 命名空间 - 部署后自动创建
 [[kv_namespaces]]
 binding = "BTC_STATE"
-id = "PLACEHOLDER"  # 部署时替换
+id = "d706d6a3b0ef42f8a048ac837ced3d90"
 
 # Cron 触发器 - 每分钟执行一次
 [triggers]
