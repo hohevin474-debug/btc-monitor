@@ -11,6 +11,4 @@ id = "d706d6a3b0ef42f8a048ac837ced3d90"
 [triggers]
 crons = ["* * * * *"]
 
-# 免费计划限制内
-[limits]
-cpu_ms = 5000
+# Free plan - no limits section needed
