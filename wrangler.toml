@@ -1,0 +1,16 @@
+name = "btc-monitor"
+main = "src/worker.js"
+compatibility_date = "2025-07-20"
+
+# KV 命名空间 - 部署后自动创建
+[[kv_namespaces]]
+binding = "BTC_STATE"
+id = "PLACEHOLDER"  # 部署时替换
+
+# Cron 触发器 - 每分钟执行一次
+[triggers]
+crons = ["* * * * *"]
+
+# 免费计划限制内
+[limits]
+cpu_ms = 5000

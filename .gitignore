@@ -1,0 +1,11 @@
+# 依赖
+node_modules/
+.wrangler/
+
+# 环境
+.env
+.env.local
+
+# 系统
+.DS_Store
+Thumbs.db
