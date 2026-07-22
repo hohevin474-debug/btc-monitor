@@ -295,8 +295,8 @@ async function fetchAndAnalyze(env) {
           `RSI: ${signal.rsi}`,
         ].join('\n');
         const urgency = probPct >= 70 ? 'timeSensitive' : 'active';
-        // 不 await，异步发送
-        sendBark(title, body, urgency);
+        // await 确保推送完成
+        await sendBark(title, body, urgency);
         state.last_signal_time = now / 1000;
         state.last_signal_dir = signal.direction;
       }
