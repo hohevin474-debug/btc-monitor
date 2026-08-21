@@ -9,3 +9,4 @@ node_modules/
 # 系统
 .DS_Store
 Thumbs.db
+public/dashboard.html
