@@ -16,6 +16,10 @@ const BARK_KEY = 'jNVNkxWwVd88vNYoq7RxMa';
 const BARK_URL = `https://api.day.app/${BARK_KEY}`;
 const BARK_COOLDOWN = 180; // 同一方向信号最小间隔（秒）
 
+// 暂停开关：true = 暂停推送（系统继续记录价格，但不发 Bark）
+// 恢复推送时改为 false 并重新部署
+const PAUSE_PUSH = true;
+
 // CoinLore API 获取 BTC 价格
 const COINLORE_URL = 'https://api.coinlore.net/api/ticker/?id=90';
 
@@ -279,10 +283,10 @@ async function fetchAndAnalyze(env) {
       });
       if (state.history.length > 100) state.history.shift();
 
-      // Bark推送
+      // Bark推送（若暂停则跳过推送，但仍记录信号历史）
       const cooldownOk = (now / 1000 - (state.last_signal_time || 0)) >= BARK_COOLDOWN;
       const dirChanged = state.last_signal_dir !== signal.direction;
-      if (cooldownOk || dirChanged) {
+      if ((cooldownOk || dirChanged) && !PAUSE_PUSH) {
         const dirCN = signal.direction === 'LONG' ? '做多 LONG 📈' : '做空 SHORT 📉';
         const emoji = signal.direction === 'LONG' ? '🟢' : '🔴';
         const probPct = (signal.probability * 100).toFixed(0);
