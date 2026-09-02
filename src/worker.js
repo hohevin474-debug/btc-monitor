@@ -18,7 +18,7 @@ const BARK_COOLDOWN = 180; // 同一方向信号最小间隔（秒）
 
 // 暂停开关：true = 暂停推送（系统继续记录价格，但不发 Bark）
 // 恢复推送时改为 false 并重新部署
-const PAUSE_PUSH = true;
+const PAUSE_PUSH = false;
 
 // CoinLore API 获取 BTC 价格
 const COINLORE_URL = 'https://api.coinlore.net/api/ticker/?id=90';
