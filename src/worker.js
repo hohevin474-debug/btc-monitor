@@ -210,6 +210,85 @@ async function saveState(env, state) {
 }
 
 // ============================================================
+// 回测记录：信号发出后，追踪未来 1/6/24 小时实际价格
+// 用于事后计算真实方向准确率与 500 点达标率
+// 独立存储于 KV key 'backtest'，不受 prices(300点) 轮转影响
+// ============================================================
+
+const BT_KEY = 'backtest';
+const BT_MAX = 500;              // 最多保留记录数
+const H1 = 3600, H6 = 21600, H24 = 86400;
+
+async function getBacktest(env) {
+  const raw = await env.BTC_STATE.get(BT_KEY, 'json');
+  return (raw && Array.isArray(raw.records)) ? raw.records : [];
+}
+
+async function saveBacktest(env, records) {
+  await env.BTC_STATE.put(BT_KEY, JSON.stringify({ records }));
+}
+
+// 新增一条待验证信号
+async function recordSignal(env, signal, price, nowMs) {
+  const records = await getBacktest(env);
+  records.push({
+    id: nowMs,
+    time: nowMs / 1000,
+    direction: signal.direction,
+    price: price,
+    probability: signal.probability,
+    predicted_move: signal.predicted_move,
+    h1: null, h6: null, h24: null,
+    done: false,
+  });
+  if (records.length > BT_MAX) records.splice(0, records.length - BT_MAX);
+  await saveBacktest(env, records);
+}
+
+// 每次运行时回填已达时间窗的实际价格
+async function backfillBacktest(env, price, nowMs) {
+  const records = await getBacktest(env);
+  if (!records.length) return;
+  let changed = false;
+  const nowSec = nowMs / 1000;
+  for (const r of records) {
+    if (r.done) continue;
+    const age = nowSec - r.time;
+    if (r.h1 === null && age >= H1) { r.h1 = price; changed = true; }
+    if (r.h6 === null && age >= H6) { r.h6 = price; changed = true; }
+    if (r.h24 === null && age >= H24) { r.h24 = price; r.done = true; changed = true; }
+  }
+  if (changed) await saveBacktest(env, records);
+}
+
+// 统计准确率
+function computeAccuracy(records) {
+  const stat = (field, label) => {
+    const list = records.filter(r => r[field] !== null);
+    if (!list.length) return { label, n: 0, dirAcc: null, hit500: null };
+    let dirOk = 0, hit = 0;
+    for (const r of list) {
+      const future = r[field];
+      const diff = future - r.price;
+      const correct = r.direction === 'SHORT' ? diff < 0 : diff > 0;
+      if (correct) dirOk++;
+      if (Math.abs(diff) >= 500) hit++;
+    }
+    return {
+      label,
+      n: list.length,
+      dirAcc: +((dirOk / list.length) * 100).toFixed(1),
+      hit500: +((hit / list.length) * 100).toFixed(1),
+    };
+  };
+  return {
+    total: records.length,
+    completed: records.filter(r => r.done).length,
+    windows: [stat('h1', '1小时'), stat('h6', '6小时'), stat('h24', '24小时')],
+  };
+}
+
+// ============================================================
 // 主逻辑：拉取价格 + 分析
 // ============================================================
 async function fetchAndAnalyze(env) {
@@ -283,6 +362,9 @@ async function fetchAndAnalyze(env) {
       });
       if (state.history.length > 100) state.history.shift();
 
+      // 记录待回测验证（无论是否推送都记录，保证样本完整）
+      await recordSignal(env, signal, newPrice, now);
+
       // Bark推送（若暂停则跳过推送，但仍记录信号历史）
       const cooldownOk = (now / 1000 - (state.last_signal_time || 0)) >= BARK_COOLDOWN;
       const dirChanged = state.last_signal_dir !== signal.direction;
@@ -306,6 +388,9 @@ async function fetchAndAnalyze(env) {
       }
     }
   }
+
+  // 回填回测记录（用最新价格更新已达 1h/6h/24h 的窗口）
+  await backfillBacktest(env, newPrice, now);
 
   await saveState(env, state);
   return state;
@@ -370,6 +455,25 @@ export default {
         points: state.prices.length,
         last_update: state.last_update,
       }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders },
+      });
+    }
+
+    // API: 回测统计（真实准确率）
+    if (path === '/api/backtest') {
+      const records = await getBacktest(env);
+      const acc = computeAccuracy(records);
+      // 附带最近 20 条明细，便于核查
+      const recent = records.slice(-20).map(r => ({
+        time: r.time,
+        direction: r.direction,
+        price: r.price,
+        prob: r.probability,
+        h1: r.h1, h6: r.h6, h24: r.h24,
+        done: r.done,
+      }));
+      return new Response(JSON.stringify({ accuracy: acc, recent }), {
         status: 200,
         headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders },
       });
