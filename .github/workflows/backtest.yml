@@ -1,0 +1,48 @@
+name: Strategy Backtest
+
+# 离线策略回测：用 OKX 真实历史 K 线跑网格搜索
+# 沙箱无法直连交易所，但 GitHub runner 网络不受限，这里作为回测计算环境
+on:
+  workflow_dispatch:
+    inputs:
+      bar:
+        description: 'K线周期'
+        required: false
+        default: '1H'
+        type: choice
+        options: ['15m', '1H', '4H']
+      total:
+        description: 'K线数量'
+        required: false
+        default: '1500'
+      target:
+        description: '目标点数'
+        required: false
+        default: '500'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run backtest
+        env:
+          BT_BAR: ${{ inputs.bar }}
+          BT_TOTAL: ${{ inputs.total }}
+          BT_TARGET: ${{ inputs.target }}
+        run: node scripts/backtest.mjs 2>&1 | tee backtest_output.txt
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-report-${{ inputs.bar }}-${{ github.run_number }}
+          path: |
+            backtest_report.json
+            backtest_output.txt
