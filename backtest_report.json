@@ -7,7 +7,7 @@
     "to": "2026-09-03T07:49:42.915Z",
     "price": 69724.99998972515,
     "avgATR": 250,
-    "generatedAt": "2026-09-03T08:50:08.019Z"
+    "generatedAt": "2026-09-03T08:55:09.170Z"
   },
   "moveDistribution": {
     "1": {
@@ -217,6 +217,80 @@
       },
       "avgMFE": 464,
       "avgMAE": -553
+    },
+    "v2": {
+      "n": 711,
+      "horizons": {
+        "1": {
+          "n": 711,
+          "dirAcc": 50.6,
+          "hitRate": 0,
+          "avgWin": 104,
+          "avgLoss": -100,
+          "avgAbs": 102,
+          "pf": 1.06,
+          "expectancy": 3
+        },
+        "6": {
+          "n": 711,
+          "dirAcc": 53.3,
+          "hitRate": 11.3,
+          "avgWin": 255,
+          "avgLoss": -235,
+          "avgAbs": 246,
+          "pf": 1.24,
+          "expectancy": 26
+        },
+        "24": {
+          "n": 711,
+          "dirAcc": 53.2,
+          "hitRate": 42.5,
+          "avgWin": 579,
+          "avgLoss": -459,
+          "avgAbs": 523,
+          "pf": 1.43,
+          "expectancy": 93
+        }
+      },
+      "avgMFE": 570,
+      "avgMAE": -487
+    },
+    "v2squeeze": {
+      "n": 740,
+      "horizons": {
+        "1": {
+          "n": 740,
+          "dirAcc": 50.4,
+          "hitRate": 0,
+          "avgWin": 104,
+          "avgLoss": -100,
+          "avgAbs": 102,
+          "pf": 1.05,
+          "expectancy": 3
+        },
+        "6": {
+          "n": 740,
+          "dirAcc": 52.8,
+          "hitRate": 11.1,
+          "avgWin": 255,
+          "avgLoss": -235,
+          "avgAbs": 246,
+          "pf": 1.22,
+          "expectancy": 24
+        },
+        "24": {
+          "n": 740,
+          "dirAcc": 53.2,
+          "hitRate": 42.6,
+          "avgWin": 580,
+          "avgLoss": -456,
+          "avgAbs": 522,
+          "pf": 1.45,
+          "expectancy": 96
+        }
+      },
+      "avgMFE": 569,
+      "avgMAE": -486
     }
   },
   "best": {
@@ -841,6 +915,280 @@
           },
           "avgMFE": 473,
           "avgMAE": -610
+        }
+      }
+    ],
+    "v2": [
+      {
+        "params": {
+          "minAtrPct": 0.15,
+          "momPeriod": 48,
+          "threshold": 0.3,
+          "wBreak": 0.15
+        },
+        "summary": {
+          "n": 627,
+          "horizons": {
+            "1": {
+              "n": 627,
+              "dirAcc": 51.7,
+              "hitRate": 0,
+              "avgWin": 102,
+              "avgLoss": -101,
+              "avgAbs": 102,
+              "pf": 1.08,
+              "expectancy": 4
+            },
+            "6": {
+              "n": 627,
+              "dirAcc": 53.1,
+              "hitRate": 9.6,
+              "avgWin": 255,
+              "avgLoss": -224,
+              "avgAbs": 241,
+              "pf": 1.29,
+              "expectancy": 30
+            },
+            "24": {
+              "n": 627,
+              "dirAcc": 55,
+              "hitRate": 43.9,
+              "avgWin": 604,
+              "avgLoss": -420,
+              "avgAbs": 521,
+              "pf": 1.76,
+              "expectancy": 143
+            }
+          },
+          "avgMFE": 587,
+          "avgMAE": -462
+        }
+      },
+      {
+        "params": {
+          "minAtrPct": 0.25,
+          "momPeriod": 48,
+          "threshold": 0.3,
+          "wBreak": 0.15
+        },
+        "summary": {
+          "n": 624,
+          "horizons": {
+            "1": {
+              "n": 624,
+              "dirAcc": 51.6,
+              "hitRate": 0,
+              "avgWin": 102,
+              "avgLoss": -101,
+              "avgAbs": 102,
+              "pf": 1.07,
+              "expectancy": 4
+            },
+            "6": {
+              "n": 624,
+              "dirAcc": 52.9,
+              "hitRate": 9.6,
+              "avgWin": 257,
+              "avgLoss": -224,
+              "avgAbs": 242,
+              "pf": 1.29,
+              "expectancy": 30
+            },
+            "24": {
+              "n": 624,
+              "dirAcc": 55,
+              "hitRate": 43.8,
+              "avgWin": 603,
+              "avgLoss": -421,
+              "avgAbs": 521,
+              "pf": 1.75,
+              "expectancy": 142
+            }
+          },
+          "avgMFE": 586,
+          "avgMAE": -462
+        }
+      },
+      {
+        "params": {
+          "minAtrPct": 0.15,
+          "momPeriod": 48,
+          "threshold": 0.3,
+          "wBreak": 0.25
+        },
+        "summary": {
+          "n": 637,
+          "horizons": {
+            "1": {
+              "n": 637,
+              "dirAcc": 51.5,
+              "hitRate": 0,
+              "avgWin": 103,
+              "avgLoss": -102,
+              "avgAbs": 103,
+              "pf": 1.07,
+              "expectancy": 3
+            },
+            "6": {
+              "n": 637,
+              "dirAcc": 52.6,
+              "hitRate": 9.6,
+              "avgWin": 254,
+              "avgLoss": -228,
+              "avgAbs": 242,
+              "pf": 1.24,
+              "expectancy": 26
+            },
+            "24": {
+              "n": 637,
+              "dirAcc": 54.8,
+              "hitRate": 44.1,
+              "avgWin": 598,
+              "avgLoss": -432,
+              "avgAbs": 523,
+              "pf": 1.68,
+              "expectancy": 132
+            }
+          },
+          "avgMFE": 581,
+          "avgMAE": -470
+        }
+      }
+    ],
+    "v2squeeze": [
+      {
+        "params": {
+          "minAtrPct": 0.25,
+          "momPeriod": 24,
+          "threshold": 0.35,
+          "squeezeQ": 0.2
+        },
+        "summary": {
+          "n": 496,
+          "horizons": {
+            "1": {
+              "n": 496,
+              "dirAcc": 50.8,
+              "hitRate": 0,
+              "avgWin": 104,
+              "avgLoss": -100,
+              "avgAbs": 102,
+              "pf": 1.07,
+              "expectancy": 3
+            },
+            "6": {
+              "n": 496,
+              "dirAcc": 54.2,
+              "hitRate": 11.1,
+              "avgWin": 260,
+              "avgLoss": -231,
+              "avgAbs": 247,
+              "pf": 1.33,
+              "expectancy": 35
+            },
+            "24": {
+              "n": 496,
+              "dirAcc": 54,
+              "hitRate": 42.5,
+              "avgWin": 603,
+              "avgLoss": -417,
+              "avgAbs": 518,
+              "pf": 1.7,
+              "expectancy": 134
+            }
+          },
+          "avgMFE": 587,
+          "avgMAE": -458
+        }
+      },
+      {
+        "params": {
+          "minAtrPct": 0.15,
+          "momPeriod": 24,
+          "threshold": 0.35,
+          "squeezeQ": 0.2
+        },
+        "summary": {
+          "n": 497,
+          "horizons": {
+            "1": {
+              "n": 497,
+              "dirAcc": 50.9,
+              "hitRate": 0,
+              "avgWin": 104,
+              "avgLoss": -100,
+              "avgAbs": 102,
+              "pf": 1.07,
+              "expectancy": 4
+            },
+            "6": {
+              "n": 497,
+              "dirAcc": 54.3,
+              "hitRate": 11.1,
+              "avgWin": 259,
+              "avgLoss": -231,
+              "avgAbs": 246,
+              "pf": 1.33,
+              "expectancy": 35
+            },
+            "24": {
+              "n": 497,
+              "dirAcc": 53.9,
+              "hitRate": 42.5,
+              "avgWin": 603,
+              "avgLoss": -416,
+              "avgAbs": 517,
+              "pf": 1.69,
+              "expectancy": 133
+            }
+          },
+          "avgMFE": 586,
+          "avgMAE": -459
+        }
+      },
+      {
+        "params": {
+          "minAtrPct": 0.25,
+          "momPeriod": 24,
+          "threshold": 0.35,
+          "squeezeQ": 0.3
+        },
+        "summary": {
+          "n": 508,
+          "horizons": {
+            "1": {
+              "n": 508,
+              "dirAcc": 50.4,
+              "hitRate": 0,
+              "avgWin": 104,
+              "avgLoss": -101,
+              "avgAbs": 103,
+              "pf": 1.04,
+              "expectancy": 2
+            },
+            "6": {
+              "n": 508,
+              "dirAcc": 53.3,
+              "hitRate": 10.8,
+              "avgWin": 259,
+              "avgLoss": -233,
+              "avgAbs": 247,
+              "pf": 1.27,
+              "expectancy": 29
+            },
+            "24": {
+              "n": 508,
+              "dirAcc": 53.7,
+              "hitRate": 42.7,
+              "avgWin": 599,
+              "avgLoss": -419,
+              "avgAbs": 516,
+              "pf": 1.66,
+              "expectancy": 129
+            }
+          },
+          "avgMFE": 582,
+          "avgMAE": -463
         }
       }
     ]

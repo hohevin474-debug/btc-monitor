@@ -300,12 +300,96 @@ function strategyTrendPullback(candles, p = {}) {
   return { dir: 'WAIT', strength: 0 };
 }
 
+/**
+ * F. V2 候选策略：趋势跟随 + 波动率门槛
+ *
+ * 设计理由（针对现行系统的三个实证缺陷）：
+ *   1. 周期错配：500 点在 1H 窗口概率仅 15.8%，24H 窗口 41.9%
+ *      → 本策略以 24H 为目标窗口，不再用 1H 判定
+ *   2. 均值回归在趋势行情中持续亏损（合成数据 24H 期望 -66 点）
+ *      → 改为趋势跟随：动量 + 均线排列 + 突破，RSI 只作动量确认不做反转
+ *   3. 低波动期推送无意义（此时 500 点不可能达成）
+ *      → 加 ATR 门槛，波动率不足直接不发信号
+ */
+function strategyV2(candles, p = {}) {
+  const closes = candles.map(c => c.c);
+  if (closes.length < 60) return { dir: 'WAIT', strength: 0, score: 0 };
+
+  const price = closes[closes.length - 1];
+  const atr = calcATR(candles, p.atrPeriod || 14);
+  const atrPct = atr / price * 100;
+
+  // 波动率门槛：太安静的市不参与（500 点目标不现实）
+  if (atrPct < (p.minAtrPct ?? 0.25)) return { dir: 'WAIT', strength: 0, score: 0 };
+
+  // 动量（主权重）：过去 N 根收益率
+  const momN = p.momPeriod || 24;
+  const past = closes[closes.length - 1 - momN];
+  const mom = (price - past) / past * 100;
+
+  // 均线排列（趋势方向）
+  const maFast = sma(closes, p.fastMA || 10);
+  const maSlow = sma(closes, p.slowMA || 40);
+  const trendScore = (maFast - maSlow) / maSlow * 100;
+
+  // 突破：相对最近 N 根（不含当前）的高低点
+  const lookback = p.breakLookback || 24;
+  const prev = candles.slice(0, -1).slice(-lookback);
+  const hh = Math.max(...prev.map(c => c.h));
+  const ll = Math.min(...prev.map(c => c.l));
+  const breakUp = price > hh;
+  const breakDown = price < ll;
+
+  // 成交量确认
+  const vols = candles.map(c => c.vol);
+  const volNow = sma(vols.slice(-12), 12);
+  const volPrev = sma(vols.slice(-24, -12), 12);
+  const volRatio = volPrev > 0 ? volNow / volPrev : 1;
+
+  // RSI 仅作动量确认（不再做反转信号）
+  const rsi = calcRSI(closes, 14);
+  const rsiMomentum = (rsi - 50) / 50;   // +1 表示强动量，-1 表示弱
+
+  let score = 0;
+  score += clamp(mom / (p.momScale ?? 2), -1, 1) * (p.wMom ?? 0.35);
+  score += clamp(trendScore / (p.trendScale ?? 0.5), -1, 1) * (p.wTrend ?? 0.2);
+  score += rsiMomentum * (p.wRsi ?? 0.1);
+  if (breakUp) score += (p.wBreak ?? 0.25);
+  if (breakDown) score -= (p.wBreak ?? 0.25);
+  if (p.requireVolume !== false && volRatio > (p.volRatio ?? 1.1)) {
+    score *= (p.volBoost ?? 1.15);   // 放量增强信号
+  }
+
+  const thr = p.threshold ?? 0.25;
+  const dir = score > thr ? 'LONG' : score < -thr ? 'SHORT' : 'WAIT';
+  return { dir, strength: Math.abs(score), score };
+}
+
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/**
+ * G. 组合策略：趋势跟随为主，布林挤压突破为辅（捕捉波动率扩张）
+ */
+function strategyV2Squeeze(candles, p = {}) {
+  const r = strategyV2(candles, p);
+  if (r.dir !== 'WAIT') return r;
+  // 主策略无信号时，尝试挤压突破
+  const sq = strategySqueeze(candles, {
+    bbPeriod: p.bbPeriod || 20,
+    squeezeQ: p.squeezeQ || 0.25,
+    bbMult: p.bbMult || 2,
+  });
+  return sq;
+}
+
 const STRATEGIES = {
   meanReversion: { fn: strategyMeanReversion, name: '均值回归(现行策略)' },
   breakout: { fn: strategyBreakout, name: '趋势突破' },
   squeeze: { fn: strategySqueeze, name: '布林挤压突破' },
   momentum: { fn: strategyMomentum, name: '动量' },
   trendPullback: { fn: strategyTrendPullback, name: '趋势回调' },
+  v2: { fn: strategyV2, name: 'V2趋势跟随' },
+  v2squeeze: { fn: strategyV2Squeeze, name: 'V2+挤压突破' },
 };
 
 // ============================================================
@@ -511,6 +595,18 @@ async function main() {
     squeeze: { bbPeriod: [20], squeezeQ: [0.15, 0.25, 0.4], bbMult: [1.5, 2, 2.5] },
     trendPullback: { fastMA: [5, 10, 20], slowMA: [30, 40, 60], rsiEntry: [35, 45, 55] },
     meanReversion: { rsiPeriod: [14], threshold: [0.18, 0.3, 0.45] },
+    v2: {
+      minAtrPct: [0.15, 0.25, 0.4],
+      momPeriod: [12, 24, 48],
+      threshold: [0.2, 0.3, 0.45],
+      wBreak: [0.15, 0.25],
+    },
+    v2squeeze: {
+      minAtrPct: [0.15, 0.25],
+      momPeriod: [12, 24],
+      threshold: [0.25, 0.35],
+      squeezeQ: [0.2, 0.3],
+    },
   };
 
   const best = {};

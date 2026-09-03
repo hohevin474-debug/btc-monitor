@@ -133,8 +133,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Micr
 </div>
 <div class="card" style="grid-column:1/-1">
 <div class="card-header"><span class="card-title">🎯 真实回测准确率</span><span style="font-size:.75em;color:var(--sub)" id="btTotal">加载中...</span></div>
-<div style="overflow-x:auto"><table class="sig-table"><thead><tr><th>验证窗口</th><th>样本数</th><th>方向准确率</th><th>500点达标率</th><th>平均实际波幅</th><th>平均预判波幅</th></tr></thead><tbody id="btBody"><tr><td colspan="6" style="text-align:center;color:var(--sub);padding:20px">加载中...</td></tr></tbody></table></div>
+<div style="overflow-x:auto"><table class="sig-table"><thead><tr><th>验证窗口</th><th>样本数</th><th>方向准确率</th><th>终点达标率</th><th>过程机会率</th><th>平均最大盈利</th><th>平均最大亏损</th></tr></thead><tbody id="btBody"><tr><td colspan="7" style="text-align:center;color:var(--sub);padding:20px">加载中...</td></tr></tbody></table></div>
+<div style="margin-top:6px;font-size:.72em;color:var(--sub)">终点达标率 = 窗口<b>结束</b>时达到500点 ｜ 过程机会率 = 窗口内<b>曾经出现</b>过500点有利波动，更真实反映可捕捉的盈利空间</div>
 <div style="margin-top:8px;font-size:.75em;color:var(--sub)" id="btTier"></div>
+</div>
+<div class="card" style="grid-column:1/-1">
+<div class="card-header"><span class="card-title">⚖️ 策略 A/B 实盘对比</span><span style="font-size:.75em;color:var(--sub)" id="abNote">加载中...</span></div>
+<div style="overflow-x:auto"><table class="sig-table"><thead><tr><th>策略</th><th>样本</th><th>24H方向准确率</th><th>24H过程机会率</th><th>平均最大盈利</th><th>平均最大亏损</th></tr></thead><tbody id="abBody"><tr><td colspan="6" style="text-align:center;color:var(--sub);padding:20px">加载中...</td></tr></tbody></table></div>
+<div style="margin-top:8px;font-size:.75em;color:var(--sub)" id="abVerdict"></div>
 </div>
 <div class="card" style="grid-column:1/-1">
 <div class="card-header"><span class="card-title">📜 信号历史</span><span style="font-size:.75em;color:var(--sub)" id="historyCount">0条</span></div>
@@ -282,22 +288,59 @@ let r=await fetch(API_BASE+'/api/backtest?t='+Date.now()),d=await r.json();
 let acc=d.accuracy||{};
 document.getElementById('btTotal').textContent='累计 '+acc.total+' 条记录';
 let rows=(acc.windows||[]).map(w=>{
-if(!w.n) return '<tr><td>'+w.label+'</td><td colspan="5" style="text-align:center;color:var(--sub)">样本不足</td></tr>';
+if(!w.n) return '<tr><td>'+w.label+'</td><td colspan="6" style="text-align:center;color:var(--sub)">样本不足</td></tr>';
 let accColor=w.dirAcc>=60?'var(--green)':w.dirAcc>=50?'#ffb020':'var(--red)';
+let oppColor=(w.opportunityRate||0)>=50?'var(--green)':(w.opportunityRate||0)>=30?'#ffb020':'var(--sub)';
 return '<tr><td>'+w.label+'</td><td>'+w.n+'</td>'+
 '<td style="color:'+accColor+';font-weight:700">'+w.dirAcc+'%</td>'+
-'<td>'+w.hit500+'%</td><td>'+w.avgMove+' 点</td><td>'+w.avgPredicted+' 点</td></tr>';
+'<td>'+w.hit500+'%</td>'+
+'<td style="color:'+oppColor+';font-weight:700">'+(w.opportunityRate!=null?w.opportunityRate+'%':'—')+'</td>'+
+'<td style="color:var(--green)">'+(w.avgMFE!=null?w.avgMFE+' 点':'—')+'</td>'+
+'<td style="color:var(--red)">'+(w.avgMAE!=null?w.avgMAE+' 点':'—')+'</td></tr>';
 }).join('');
-document.getElementById('btBody').innerHTML=rows||'<tr><td colspan="6" style="text-align:center;color:var(--sub);padding:20px">暂无数据</td></tr>';
+document.getElementById('btBody').innerHTML=rows||'<tr><td colspan="7" style="text-align:center;color:var(--sub);padding:20px">暂无数据</td></tr>';
+
 let tier=acc.tier||{};
 let tierTxt='分级表现 → ';
 tierTxt+='重大行情('+(tier.big?tier.big.n:0)+'条) ';
 let bigW=(tier.big&&tier.big.windows)?tier.big.windows[0]:null;
-tierTxt+= bigW&&bigW.n ? '方向准确率 '+bigW.dirAcc+'% / 500点达标 '+bigW.hit500+'%' : '暂无样本';
+tierTxt+= bigW&&bigW.n ? '准确率 '+bigW.dirAcc+'% / 机会率 '+bigW.opportunityRate+'%' : '暂无样本';
 tierTxt+=' ｜ 常规信号('+(tier.normal?tier.normal.n:0)+'条) ';
 let nW=(tier.normal&&tier.normal.windows)?tier.normal.windows[0]:null;
-tierTxt+= nW&&nW.n ? '方向准确率 '+nW.dirAcc+'% / 500点达标 '+nW.hit500+'%' : '暂无样本';
+tierTxt+= nW&&nW.n ? '准确率 '+nW.dirAcc+'% / 机会率 '+nW.opportunityRate+'%' : '暂无样本';
 document.getElementById('btTier').textContent=tierTxt;
+
+// 策略 A/B 对比
+let ab=acc.byStrategy||{};
+let names={v1:'V1 均值回归',v2:'V2 趋势跟随'};
+let abRows=Object.keys(ab).map(k=>{
+let s=ab[k];
+let w24=(s.windows||[])[2]||{};
+if(!w24.n) return '<tr><td>'+(names[k]||k)+'</td><td colspan="5" style="text-align:center;color:var(--sub)">24H样本不足</td></tr>';
+let c24=w24.dirAcc>=60?'var(--green)':w24.dirAcc>=50?'#ffb020':'var(--red)';
+return '<tr><td>'+(names[k]||k)+'</td><td>'+s.n+'</td>'+
+'<td style="color:'+c24+';font-weight:700">'+w24.dirAcc+'%</td>'+
+'<td>'+(w24.opportunityRate!=null?w24.opportunityRate+'%':'—')+'</td>'+
+'<td style="color:var(--green)">'+(w24.avgMFE!=null?w24.avgMFE+' 点':'—')+'</td>'+
+'<td style="color:var(--red)">'+(w24.avgMAE!=null?w24.avgMAE+' 点':'—')+'</td></tr>';
+}).join('');
+document.getElementById('abBody').innerHTML=abRows||'<tr><td colspan="6" style="text-align:center;color:var(--sub);padding:20px">暂无数据</td></tr>';
+
+let verdict='';
+let a=ab.v1,b=ab.v2;
+let w1=a?((a.windows||[])[2]||{}):null;
+let w2=b?((b.windows||[])[2]||{}):null;
+if(w1&&w1.n>=10&&w2&&w2.n>=10){
+let s1=(w1.avgMFE||0)+(w1.avgMAE||0);
+let s2=(w2.avgMFE||0)+(w2.avgMAE||0);
+verdict='样本已足够对比 → '+(s2>s1?'V2 趋势跟随 占优（盈利空间更大）':'V1 均值回归 占优')+
+' ｜ V1 净空间 '+Math.round(s1)+'点 vs V2 净空间 '+Math.round(s2)+'点';
+}else{
+let need=Math.max(0,10-Math.max((w1&&w1.n)||0,(w2&&w2.n)||0));
+verdict='样本积累中，需各策略 ≥10 条 24H 样本才能下结论（当前 V1 '+((w1&&w1.n)||0)+' 条 / V2 '+((w2&&w2.n)||0)+' 条）';
+}
+document.getElementById('abVerdict').textContent=verdict;
+document.getElementById('abNote').textContent='每30分钟各记录一条样本';
 }catch(e){console.error('Backtest load error:',e)}
 }
 refresh();setInterval(refresh,15000);
