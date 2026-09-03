@@ -1,0 +1,38 @@
+name: Fetch OKX Klines
+
+# 沙箱环境的 DNS 把交易所域名黑洞掉了（alidns 对 www.okx.com 返回 169.254.0.2），
+# 但 Actions runner 在美国机房，网络不受限。
+# 这里把「抓历史 K 线」这件事搬到云端做，产物用 artifact 带回本地跑回测。
+on:
+  workflow_dispatch:
+    inputs:
+      bar:
+        description: 'K线周期 (1m/5m/15m/1H/4H/1D)'
+        required: false
+        default: '1H'
+      total:
+        description: '抓取根数'
+        required: false
+        default: '3000'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch klines
+        run: node scripts/fetch-klines.mjs ${{ github.event.inputs.bar }} ${{ github.event.inputs.total }} klines.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: klines-${{ github.event.inputs.bar }}
+          path: klines.json
+          retention-days: 7
