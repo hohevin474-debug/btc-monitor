@@ -656,4 +656,15 @@ async function main() {
   console.log(`${'='.repeat(70)}\n`);
 }
 
-main().catch(e => { console.error('❌ 回测失败:', e); process.exit(1); });
+// BT_LIB=1 时只当库用，不执行 main（供 validate.mjs 复用）
+if (process.env.BT_LIB !== '1') {
+  main().catch(e => { console.error('❌ 回测失败:', e); process.exit(1); });
+}
+
+export {
+  runBacktest, gridSearch, summarize, STRATEGIES,
+  calcRSI, calcEMA, calcMACD, calcBB, calcATR, sma,
+  strategyMeanReversion, strategyBreakout, strategySqueeze,
+  strategyMomentum, strategyTrendPullback, strategyV2, strategyV2Squeeze,
+  fetchCandles,
+};

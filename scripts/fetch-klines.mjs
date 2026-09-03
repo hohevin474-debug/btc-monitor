@@ -16,20 +16,29 @@ const bar = process.argv[2] || '1H';
 const total = parseInt(process.argv[3] || '3000', 10);
 const out = process.argv[4] || `/tmp/klines_${bar}.json`;
 
-const BASE = 'https://www.okx.com/api/v5/market/candles';
-const MAX_PER_REQ = 300; // OKX v5 单页上限
+// market/candles 的最新数据只回溯约 1440 根（1H ≈ 60 天），
+// 要更早的历史得切到 history-candles（单页上限 100，但能一直往前翻）。
+const ENDPOINTS = [
+  { url: 'https://www.okx.com/api/v5/market/candles', max: 300, tag: 'candles' },
+  { url: 'https://www.okx.com/api/v5/market/history-candles', max: 100, tag: 'history' },
+];
 
-async function fetchPage(after) {
-  const url = `${BASE}?instId=BTC-USDT&bar=${bar}&limit=${MAX_PER_REQ}` +
+async function fetchFrom(ep, after) {
+  const url = `${ep.url}?instId=BTC-USDT&bar=${bar}&limit=${ep.max}` +
     (after ? `&after=${after}` : '');
   const res = await fetch(url, {
     headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
     signal: AbortSignal.timeout(15000),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} @ ${url}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} @ ${ep.tag}`);
   const json = await res.json();
-  if (json.code !== '0') throw new Error(`OKX error ${json.code}: ${json.msg}`);
+  if (json.code !== '0') throw new Error(`OKX ${ep.tag} error ${json.code}: ${json.msg}`);
   return json.data || [];
+}
+
+let epIdx = 0;
+async function fetchPage(after) {
+  return fetchFrom(ENDPOINTS[epIdx], after);
 }
 
 const seen = new Map(); // ts -> candle
@@ -57,7 +66,18 @@ while (seen.size < total) {
   }
   process.stderr.write(`  第 ${page} 页: +${rows.length} 根，累计 ${seen.size}，最老 ${new Date(oldest).toISOString()}\n`);
 
-  if (rows.length < MAX_PER_REQ) break; // 没有更多历史了
+  const cur = ENDPOINTS[epIdx];
+  if (rows.length < cur.max) {
+    // 当前端点翻到头了：换下一个端点（candles → history）继续往前挖
+    if (epIdx < ENDPOINTS.length - 1) {
+      epIdx += 1;
+      process.stderr.write(`  ↳ 切到 ${ENDPOINTS[epIdx].tag} 端点继续回溯\n`);
+      after = String(oldest);
+      await new Promise((r) => setTimeout(r, 300));
+      continue;
+    }
+    break;
+  }
   if (oldest === Infinity) break;
   after = String(oldest);
   await new Promise((r) => setTimeout(r, 250)); // 温柔一点，别触发限流
