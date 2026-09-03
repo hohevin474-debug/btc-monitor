@@ -114,6 +114,11 @@ const SOURCES = [
   },
 ];
 
+// 单个数据源超时（毫秒）
+// 必要性：不可达的源若只是挂起而非快速失败，会串行拖垮整个请求，
+// 导致每分钟的 cron 卡死、API 超时。正常源实测响应 <200ms，3 秒已很宽裕。
+const SOURCE_TIMEOUT_MS = 3000;
+
 // 依次尝试各数据源，返回首个可用结果 + 各源探测状态
 async function fetchQuote() {
   const probe = [];
@@ -123,6 +128,7 @@ async function fetchQuote() {
       const resp = await fetch(s.url, {
         headers: { 'User-Agent': 'BTC-Monitor/1.0' },
         cf: { cacheTtl: 0 },
+        signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
       });
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       const q = await s.parse(resp);
