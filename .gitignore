@@ -10,3 +10,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 public/dashboard.html
+
+# 回测产物（本地生成，避免与真实数据结论混淆）
+backtest_report.json
+backtest_output.txt
