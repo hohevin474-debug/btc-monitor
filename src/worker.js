@@ -1,13 +1,15 @@
 /**
  * BTC 实时监控 - Cloudflare Worker
- * 
+ *
  * 功能：
- * - 每分钟通过 Cron Trigger 拉取 BTC 价格
+ * - 每分钟通过 Cron Trigger 拉取 BTC 价格（OKX/Binance/Coinbase/CoinLore 多源故障转移）
  * - 技术分析（RSI/MACD/布林带/均线）
  * - 存储价格历史到 KV
- * - 强信号触发 Bark 推送
+ * - 分级 Bark 推送（≥500点 critical 响铃 / 其余 passive 静默）
  * - HTTP 接口提供实时面板数据
+ * - 根路径直接托管监控面板（不依赖 Pages）
  */
+import { DASHBOARD_HTML } from './dashboard.js';
 
 // ============================================================
 // 配置
@@ -632,6 +634,14 @@ export default {
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // 监控面板：Worker 自身托管，不依赖 Pages
+    if (path === '/' || path === '/index.html' || path === '/dashboard') {
+      return new Response(DASHBOARD_HTML, {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
     }
 
     // API: 获取完整状态

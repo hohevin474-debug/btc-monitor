@@ -17,16 +17,11 @@ jobs:
         with:
           node-version: '20'
 
+      # 面板已由 Worker 根路径托管（build.js 把 public/index.html 内嵌进
+      # src/dashboard.js），不再需要 Pages —— 当前 Token 也无 Pages 权限
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy
-
-      - name: Deploy Pages
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy public --project-name btc-monitor --branch main
