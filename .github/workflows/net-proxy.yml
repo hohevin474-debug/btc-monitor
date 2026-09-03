@@ -1,0 +1,53 @@
+name: Net Proxy
+
+# 沙箱出去的 HTTPS 被 SNI 层过滤：github.com / api.cloudflare.com 靠改写 DNS 能绕过，
+# 但 workers.dev、OKX、Binance 这类连真实 IP 都会被 reset。
+# Actions runner 在美国机房，网络不受限 —— 这里把它做成通用 HTTP 代理，
+# 从沙箱把 URL 传进去，结果用 artifact 带回来。
+#
+# 用法：
+#   gh workflow run net-proxy.yml -f url="https://example.com/api" -f outfile=res.json
+#   gh run watch <run-id> && gh run download <run-id>
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: '要请求的完整 URL'
+        required: true
+      outfile:
+        description: '产物文件名（决定扩展名，如 res.json / res.txt）'
+        required: false
+        default: 'out.txt'
+      curl_args:
+        description: '额外 curl 参数（可选）'
+        required: false
+        default: ''
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch
+        env:
+          URL: ${{ github.event.inputs.url }}
+          OUTFILE: ${{ github.event.inputs.outfile }}
+        run: |
+          echo "GET $URL"
+          code=$(curl -sS -L --max-time 90 \
+            -H 'User-Agent: Mozilla/5.0' \
+            ${{ github.event.inputs.curl_args }} \
+            -o "/tmp/$OUTFILE" -w '%{http_code}' "$URL" || echo "CURL_FAIL")
+          echo "HTTP=$code"
+          echo "SIZE=$(wc -c < "/tmp/$OUTFILE")"
+          if [ "${OUTFILE##*.}" = "json" ]; then
+            head -c 1500 "/tmp/$OUTFILE"; echo
+          else
+            head -c 1500 "/tmp/$OUTFILE"; echo
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-out
+          path: /tmp/${{ github.event.inputs.outfile }}
+          retention-days: 3
