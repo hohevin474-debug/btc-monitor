@@ -21,19 +21,20 @@ const BARK_COOLDOWN = 180; // 同一方向信号最小间隔（秒）
 // 分级推送阈值：预判波幅达到该点数视为"重大行情"，用最高优先级推送并忽略冷却
 const BIG_MOVE_POINTS = 500;
 
+// 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（新）
+// 两者始终并行计算并同时记录回测样本，此开关只决定推送哪一个。
+// 之所以并行：沙箱拿不到历史 K 线，无法离线回测，改用实盘 A/B 对比验证。
+const ACTIVE_STRATEGY = 'v2';
+
 // 推送/记录所需的最低概率。
 // V1 与 V2 的概率语义不同，必须用不同门槛，否则既不合理也破坏 A/B 公平性：
 //   V1 = 拍脑袋公式（predictedMove/500*0.35 + confidence*0.5 + ...），典型值 0.50~0.70
 //   V2 = 正态模型 P(24H 内朝有利方向移动 ≥500 点)，典型值 0.35~0.55
 // 两者各取自身分布中较强的一部分，样本量才可比。
+// 注意：PUSH_MIN_PROB 依赖 ACTIVE_STRATEGY，必须定义在其后（否则 TDZ 报错）
 const PUSH_MIN_PROB_V1 = 0.5;
 const PUSH_MIN_PROB_V2 = 0.35;
 const PUSH_MIN_PROB = ACTIVE_STRATEGY === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
-
-// 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（新）
-// 两者始终并行计算并同时记录回测样本，此开关只决定推送哪一个。
-// 之所以并行：沙箱拿不到历史 K 线，无法离线回测，改用实盘 A/B 对比验证。
-const ACTIVE_STRATEGY = 'v2';
 
 // 同一策略记录回测样本的最小间隔（秒）
 const BT_RECORD_INTERVAL = 1800;   // 30 分钟
