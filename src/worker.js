@@ -16,12 +16,123 @@ const BARK_KEY = 'jNVNkxWwVd88vNYoq7RxMa';
 const BARK_URL = `https://api.day.app/${BARK_KEY}`;
 const BARK_COOLDOWN = 180; // 同一方向信号最小间隔（秒）
 
+// 分级推送阈值：预判波幅达到该点数视为"重大行情"，用最高优先级推送并忽略冷却
+const BIG_MOVE_POINTS = 500;
+
 // 暂停开关：true = 暂停推送（系统继续记录价格，但不发 Bark）
 // 恢复推送时改为 false 并重新部署
 const PAUSE_PUSH = false;
 
-// CoinLore API 获取 BTC 价格
+// 24H 滚动窗口采样间隔（毫秒）：每 5 分钟一个采样点，保留 24 小时 = 288 点
+const H24_SAMPLE_MS = 5 * 60 * 1000;
+const H24_WINDOW_MS = 24 * 60 * 60 * 1000;
+const H24_MAX_POINTS = 2000;
+
+// BTC 流通量估算（用于推算市值，交易所接口不返回）
+const BTC_SUPPLY_EST = 19970000;
+
+// CoinLore API（兜底源）
 const COINLORE_URL = 'https://api.coinlore.net/api/ticker/?id=90';
+
+// ============================================================
+// 多数据源故障转移
+// 优先使用交易所官方 24H 高低价（OKX 欧易 → Binance → Coinbase → CoinLore 兜底）
+// 注意：Worker 运行在 Cloudflare 边缘，不受沙箱防火墙限制，可直连交易所
+// ============================================================
+const SOURCES = [
+  {
+    name: 'OKX',
+    url: 'https://www.okx.com/api/v5/market/tickers?instType=SPOT',
+    async parse(r) {
+      const j = await r.json();
+      const d = (j.data || []).find(x => x.instId === 'BTC-USDT');
+      if (!d || !d.last) return null;
+      const last = parseFloat(d.last);
+      const open = parseFloat(d.open24h);
+      return {
+        price: last,
+        high: parseFloat(d.high24h) || null,
+        low: parseFloat(d.low24h) || null,
+        change: open ? ((last - open) / open) * 100 : 0,
+        vol: parseFloat(d.volCcy24h) || 0,
+        ts: parseInt(d.ts) || Date.now(),
+      };
+    },
+  },
+  {
+    name: 'Binance',
+    url: 'https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT',
+    async parse(r) {
+      const d = await r.json();
+      if (!d || !d.lastPrice) return null;
+      return {
+        price: parseFloat(d.lastPrice),
+        high: parseFloat(d.highPrice) || null,
+        low: parseFloat(d.lowPrice) || null,
+        change: parseFloat(d.priceChangePercent) || 0,
+        vol: parseFloat(d.quoteVolume) || 0,
+        ts: d.closeTime || Date.now(),
+      };
+    },
+  },
+  {
+    name: 'Coinbase',
+    url: 'https://api.exchange.coinbase.com/products/BTC-USD/stats',
+    async parse(r) {
+      const d = await r.json();
+      const last = parseFloat(d.last);
+      if (!last) return null;
+      const open = parseFloat(d.open);
+      return {
+        price: last,
+        high: parseFloat(d.high) || null,
+        low: parseFloat(d.low) || null,
+        change: open ? ((last - open) / open) * 100 : 0,
+        vol: parseFloat(d.volume) * last || 0,
+        ts: Date.now(),
+      };
+    },
+  },
+  {
+    name: 'CoinLore',
+    url: COINLORE_URL,
+    async parse(r) {
+      const j = await r.json();
+      const d = j && j[0];
+      if (!d || !d.price_usd) return null;
+      return {
+        price: parseFloat(d.price_usd),
+        high: null,   // CoinLore 不提供 24H 高低，交给本地滚动窗口兜底
+        low: null,
+        change: parseFloat(d.percent_change_24h) || 0,
+        vol: parseFloat(d.volume24) || 0,
+        ts: Date.now(),
+      };
+    },
+  },
+];
+
+// 依次尝试各数据源，返回首个可用结果 + 各源探测状态
+async function fetchQuote() {
+  const probe = [];
+  for (const s of SOURCES) {
+    const t0 = Date.now();
+    try {
+      const resp = await fetch(s.url, {
+        headers: { 'User-Agent': 'BTC-Monitor/1.0' },
+        cf: { cacheTtl: 0 },
+      });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const q = await s.parse(resp);
+      if (!q || !Number.isFinite(q.price) || q.price <= 0) throw new Error('解析失败');
+      probe.push({ name: s.name, ok: true, ms: Date.now() - t0 });
+      return { quote: q, source: s.name, probe };
+    } catch (e) {
+      probe.push({ name: s.name, ok: false, err: String(e.message || e), ms: Date.now() - t0 });
+    }
+  }
+  return { quote: null, source: null, probe };
+}
 
 // ============================================================
 // 技术分析
@@ -115,9 +226,9 @@ function analyze(price, prices) {
   if (price > ma20) score += 0.05;
   else score -= 0.05;
 
-  // 宏观
-  score -= 0.22; reasons.push('🌍 美伊冲突持续，地缘政治风险');
-  score += 0.13; reasons.push('📰 CPI/PPI降温，降息预期利好');
+  // 宏观：仅作为参考信息展示，不参与打分
+  // （此前写死的 -0.22 / +0.13 净偏空 -0.09，导致信号 85% 偏向 SHORT）
+  reasons.push('🌍 宏观参考：美伊冲突风险 / CPI降温降息预期（不计入评分）');
 
   // 价格位置
   if (prices.length >= 30) {
@@ -161,15 +272,16 @@ function analyze(price, prices) {
 // ============================================================
 // Bark 推送
 // ============================================================
-async function sendBark(title, body, urgency = 'active') {
+async function sendBark(title, body, urgency = 'active', group = 'BTC-Signal') {
   try {
+    // passive（静默）时不响铃，避免常规小信号频繁打扰
+    const sound = (urgency === 'passive') ? 'silence.caf' : 'alarm.caf';
     const resp = await fetch(BARK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
       body: JSON.stringify({
-        title, body, level: urgency,
-        sound: 'alarm.caf', badge: 1,
-        group: 'BTC-Signal', isArchive: 1,
+        title, body, level: urgency, group,
+        sound, badge: 1, isArchive: 1,
       }),
     });
     const result = await resp.json();
@@ -194,6 +306,7 @@ async function getState(env) {
       vol: 14e9,
       mcap: 1.29e12,
       prices: [],
+      h24: [],
       signal: { direction: 'WAIT', probability: 0, reasons: ['初始化中...'] },
       history: [],
       last_update: Date.now(),
@@ -263,28 +376,53 @@ async function backfillBacktest(env, price, nowMs) {
 
 // 统计准确率
 function computeAccuracy(records) {
-  const stat = (field, label) => {
-    const list = records.filter(r => r[field] !== null);
-    if (!list.length) return { label, n: 0, dirAcc: null, hit500: null };
-    let dirOk = 0, hit = 0;
+  const stat = (field, label, pool = records) => {
+    const list = pool.filter(r => r[field] !== null);
+    if (!list.length) return { label, n: 0, dirAcc: null, hit500: null, avgMove: null, avgPredicted: null };
+    let dirOk = 0, hit = 0, sumMove = 0, sumPred = 0;
     for (const r of list) {
       const future = r[field];
       const diff = future - r.price;
       const correct = r.direction === 'SHORT' ? diff < 0 : diff > 0;
       if (correct) dirOk++;
       if (Math.abs(diff) >= 500) hit++;
+      sumMove += Math.abs(diff);
+      sumPred += (r.predicted_move || 0);
     }
     return {
       label,
       n: list.length,
       dirAcc: +((dirOk / list.length) * 100).toFixed(1),
       hit500: +((hit / list.length) * 100).toFixed(1),
+      avgMove: Math.round(sumMove / list.length),
+      avgPredicted: Math.round(sumPred / list.length),
     };
   };
+
+  // 分级统计：验证"重大行情"分级是否真的更有效
+  const big = records.filter(r => (r.predicted_move || 0) >= BIG_MOVE_POINTS);
+  const normal = records.filter(r => (r.predicted_move || 0) < BIG_MOVE_POINTS);
+
   return {
     total: records.length,
     completed: records.filter(r => r.done).length,
     windows: [stat('h1', '1小时'), stat('h6', '6小时'), stat('h24', '24小时')],
+    tier: {
+      big: {
+        n: big.length,
+        label: `重大行情(预判≥${BIG_MOVE_POINTS}点)`,
+        windows: [stat('h1', '1小时', big), stat('h6', '6小时', big), stat('h24', '24小时', big)],
+      },
+      normal: {
+        n: normal.length,
+        label: `常规信号(预判<${BIG_MOVE_POINTS}点)`,
+        windows: [stat('h1', '1小时', normal), stat('h6', '6小时', normal), stat('h24', '24小时', normal)],
+      },
+    },
+    dirSplit: {
+      LONG: records.filter(r => r.direction === 'LONG').length,
+      SHORT: records.filter(r => r.direction === 'SHORT').length,
+    },
   };
 }
 
@@ -296,40 +434,105 @@ async function fetchAndAnalyze(env) {
 
   // 拉取 CoinLore 价格
   let newPrice = state.price;
-  let newHigh24h = state.high_24h;
-  let newLow24h = state.low_24h;
+  // 旧数据里 low_24h 曾被写成 0、high_24h 被写成"历史最高"，这里做一次自愈
+  const validHigh = Number.isFinite(state.high_24h) && state.high_24h > 0 ? state.high_24h : null;
+  const validLow = Number.isFinite(state.low_24h) && state.low_24h > 0 ? state.low_24h : null;
+  let newHigh24h = validHigh;
+  let newLow24h = validLow;
   let newChange = state.change_24h;
   let newVol = state.vol;
-  let newMcap = state.mcap;
+
+  let quoteSource = state.source_name || null;
+  let exchangeHigh = null;   // 交易所官方 24H 最高
+  let exchangeLow = null;    // 交易所官方 24H 最低
 
   try {
-    const resp = await fetch(COINLORE_URL, {
-      headers: { 'User-Agent': 'BTC-Monitor/1.0' }
-    });
-    const data = await resp.json();
-    if (data && data[0]) {
-      const d = data[0];
-      newPrice = parseFloat(d.price_usd);
-      newChange = parseFloat(d.percent_change_24h);
-      newVol = parseFloat(d.volume24);
-      newMcap = parseFloat(d.market_cap_usd);
-
-      // 根据24h变化推算 open
-      const open = +(newPrice / (1 + newChange / 100)).toFixed(2);
-      // 追踪24H高低
-      if (newPrice > newHigh24h) newHigh24h = newPrice;
-      if (newPrice < newLow24h) newLow24h = newPrice;
+    const { quote, source, probe } = await fetchQuote();
+    state.probe = probe;                 // 各数据源可用性，供排查使用
+    if (quote) {
+      quoteSource = source;
+      newPrice = quote.price;
+      newChange = quote.change;
+      newVol = quote.vol;
+      exchangeHigh = quote.high;
+      exchangeLow = quote.low;
+      state.quote_ts = quote.ts;
     }
   } catch (e) {
-    console.error('CoinLore 拉取失败:', e);
+    console.error('行情拉取失败:', e);
   }
+  state.source_name = quoteSource;
 
-  // 更新价格历史（最多300条）
+  // 更新价格历史（最多300条，用于 RSI/MACD/布林带）
   const prices = state.prices || [];
   if (prices.length === 0 || newPrice !== prices[prices.length - 1]) {
     prices.push(newPrice);
   }
   if (prices.length > 300) prices.splice(0, prices.length - 300);
+
+  // ============================================================
+  // 真实 24H 滚动高低价窗口
+  // 旧逻辑 bug：high_24h 只增不重置（变成"历史最高"），low_24h 跌到 0
+  // 新逻辑：维护 {t,p} 采样数组，超出 24 小时的点自动淘汰
+  // ============================================================
+  const ts = Date.now();
+  let h24 = Array.isArray(state.h24) ? state.h24 : [];
+
+  if (Number.isFinite(newPrice) && newPrice > 0) {
+    const lastSample = h24.length ? h24[h24.length - 1] : null;
+    let needPush = false;
+
+    // 定时采样：每 5 分钟记一点
+    if (!lastSample || (ts - lastSample.t) >= H24_SAMPLE_MS) needPush = true;
+
+    // 极值插桩：突破窗口极值时立即记录，避免 5 分钟采样漏掉真正的高低点
+    if (!needPush && h24.length) {
+      let curMax = -Infinity, curMin = Infinity;
+      for (const s of h24) { if (s.p > curMax) curMax = s.p; if (s.p < curMin) curMin = s.p; }
+      if (newPrice > curMax || newPrice < curMin) needPush = true;
+    }
+
+    if (needPush) h24.push({ t: ts, p: newPrice });
+  }
+
+  // 淘汰超过 24 小时的采样点
+  // 用 filter 而非 shift：时间戳一旦乱序（时钟回拨 / KV 回滚旧数据），
+  // shift 只检查头部会导致过期点永久残留，把 low_24h 钉死在错误值上
+  const cutoff = ts - H24_WINDOW_MS;
+  if (h24.some(s => !(s.t > cutoff))) {
+    h24 = h24.filter(s => s.t > cutoff);
+  }
+  // 防御：检测到乱序则按时间升序重排
+  let needSort = false;
+  for (let i = 1; i < h24.length; i++) {
+    if (h24[i].t < h24[i - 1].t) { needSort = true; break; }
+  }
+  if (needSort) h24.sort((a, b) => a.t - b.t);
+  if (h24.length > H24_MAX_POINTS) h24.splice(0, h24.length - H24_MAX_POINTS);
+  state.h24 = h24;
+
+  // 本地滚动窗口的高低（兜底 + 交叉校验）
+  let localHigh = null, localLow = null;
+  if (h24.length >= 1) {
+    let hi = -Infinity, lo = Infinity;
+    for (const s of h24) { if (s.p > hi) hi = s.p; if (s.p < lo) lo = s.p; }
+    localHigh = hi; localLow = lo;
+  }
+
+  // 优先采用交易所官方 24H 高低（口径与交易所完全一致）
+  // 交易所不可用时回退到本地滚动窗口
+  if (Number.isFinite(exchangeHigh) && Number.isFinite(exchangeLow)
+      && exchangeHigh > 0 && exchangeLow > 0) {
+    newHigh24h = exchangeHigh;
+    newLow24h = exchangeLow;
+    state.hl_source = 'exchange';
+  } else if (localHigh !== null) {
+    newHigh24h = localHigh;
+    newLow24h = localLow;
+    state.hl_source = 'local';
+  }
+  state.local_high_24h = localHigh;
+  state.local_low_24h = localLow;
 
   // 技术分析
   const signal = analyze(newPrice, prices);
@@ -340,7 +543,7 @@ async function fetchAndAnalyze(env) {
   state.low_24h = newLow24h;
   state.change_24h = newChange;
   state.vol = newVol;
-  state.mcap = newMcap;
+  state.mcap = newPrice * BTC_SUPPLY_EST;   // 按流通量估算（交易所源不返回市值）
   state.prices = prices;
   state.signal = signal;
   state.last_update = Date.now();
@@ -365,24 +568,33 @@ async function fetchAndAnalyze(env) {
       // 记录待回测验证（无论是否推送都记录，保证样本完整）
       await recordSignal(env, signal, newPrice, now);
 
-      // Bark推送（若暂停则跳过推送，但仍记录信号历史）
+      // 分级推送：
+      //   重大行情（预判波幅 >= 500 点）→ critical，忽略冷却，立刻响
+      //   常规信号（概率 >= 50% 但波幅小）→ passive，静默送达，不打断
+      const isBigMove = signal.predicted_move >= BIG_MOVE_POINTS;
       const cooldownOk = (now / 1000 - (state.last_signal_time || 0)) >= BARK_COOLDOWN;
       const dirChanged = state.last_signal_dir !== signal.direction;
-      if ((cooldownOk || dirChanged) && !PAUSE_PUSH) {
+      const shouldPush = isBigMove || cooldownOk || dirChanged;
+
+      if (shouldPush && !PAUSE_PUSH) {
         const dirCN = signal.direction === 'LONG' ? '做多 LONG 📈' : '做空 SHORT 📉';
         const emoji = signal.direction === 'LONG' ? '🟢' : '🔴';
         const probPct = (signal.probability * 100).toFixed(0);
+        const tag = isBigMove ? '🚨 重大行情' : '🔔 常规信号';
         const title = `${emoji} ${dirCN}`;
         const body = [
+          `${tag}`,
           `价格: $${newPrice.toLocaleString('en-US')}`,
           `超500点概率: ${probPct}%`,
           `预判波动: ${signal.predicted_move.toLocaleString('en-US')} 点`,
           `置信度: ${(signal.confidence * 100).toFixed(0)}%`,
           `RSI: ${signal.rsi}`,
         ].join('\n');
-        const urgency = probPct >= 70 ? 'timeSensitive' : 'active';
+        // critical = 突破静音/专注模式；passive = 静默通知
+        const urgency = isBigMove ? 'critical' : 'passive';
+        const group = isBigMove ? 'BTC-重大行情' : 'BTC-常规信号';
         // await 确保推送完成
-        await sendBark(title, body, urgency);
+        await sendBark(title, body, urgency, group);
         state.last_signal_time = now / 1000;
         state.last_signal_dir = signal.direction;
       }
@@ -430,6 +642,16 @@ export default {
         price: state.price,
         high_24h: state.high_24h,
         low_24h: state.low_24h,
+        h24_points: (state.h24 || []).length,
+        h24_ready: (state.h24 || []).length > 0
+          && (Date.now() - state.h24[0].t) >= 23 * 60 * 60 * 1000, // 窗口是否已覆盖近24H
+        h24_span_hours: (state.h24 || []).length
+          ? +((Date.now() - state.h24[0].t) / 3600000).toFixed(1) : 0,
+        hl_source: state.hl_source || null,
+        local_high_24h: state.local_high_24h ?? null,
+        local_low_24h: state.local_low_24h ?? null,
+        source_name: state.source_name || null,
+        probe: state.probe || [],
         change_24h: state.change_24h,
         volume_24h: state.vol,
         market_cap: state.mcap,
