@@ -286,7 +286,9 @@ async function loadBacktest(){
 try{
 let r=await fetch(API_BASE+'/api/backtest?t='+Date.now()),d=await r.json();
 let acc=d.accuracy||{};
-document.getElementById('btTotal').textContent='累计 '+acc.total+' 条记录';
+// 主表仅统计当前生效策略；A/B 对比卡片另用全量数据（d.accuracyAll）
+let stratName=(d.activeStrategy==='v2')?'V2 趋势跟随':'V1 均值回归';
+document.getElementById('btTotal').textContent='累计 '+acc.total+' 条 '+stratName+' 记录（已排除停用策略样本）';
 let rows=(acc.windows||[]).map(w=>{
 if(!w.n) return '<tr><td>'+w.label+'</td><td colspan="6" style="text-align:center;color:var(--sub)">样本不足</td></tr>';
 let accColor=w.dirAcc>=60?'var(--green)':w.dirAcc>=50?'#ffb020':'var(--red)';
@@ -310,8 +312,9 @@ let nW=(tier.normal&&tier.normal.windows)?tier.normal.windows[0]:null;
 tierTxt+= nW&&nW.n ? '准确率 '+nW.dirAcc+'% / 机会率 '+nW.opportunityRate+'%' : '暂无样本';
 document.getElementById('btTier').textContent=tierTxt;
 
-// 策略 A/B 对比
-let ab=acc.byStrategy||{};
+// 策略 A/B 对比：必须用全量数据（accuracyAll），
+// 因为 d.accuracy 已被过滤成只剩当前策略
+let ab=(d.accuracyAll||{}).byStrategy||acc.byStrategy||{};
 let names={v1:'V1 均值回归',v2:'V2 趋势跟随'};
 let abRows=Object.keys(ab).map(k=>{
 let s=ab[k];

@@ -1026,7 +1026,15 @@ export default {
     // API: 回测统计（真实准确率）
     if (path === '/api/backtest') {
       const records = await getBacktest(env);
-      const acc = computeAccuracy(records);
+      // 主表只统计当前生效策略。已停用的 V1 样本会严重扭曲数字：
+      // 实测 V1（均值回归）在 2026-09 那波单边上涨里连开 21 条 24H 空单、
+      // 0% 正确（平均反向波动 3109 点、MAE −4057 点），混进总体统计后
+      // 把 24H 准确率压到 4.5%。那描述的是旧策略在单一行情下的失败，
+      // 跟当前系统水平无关，不该摆在面板主表。
+      const activeRecords = records.filter(r => (r.strategy || 'v1') === ACTIVE_STRATEGY);
+      const acc = computeAccuracy(activeRecords);
+      // 全量统计保留，供 A/B 对比卡片使用
+      const accAll = computeAccuracy(records);
       // 附带最近 20 条明细，便于核查
       const recent = records.slice(-20).map(r => ({
         time: r.time,
@@ -1036,7 +1044,10 @@ export default {
         h1: r.h1, h6: r.h6, h24: r.h24,
         done: r.done,
       }));
-      return new Response(JSON.stringify({ accuracy: acc, recent }), {
+      return new Response(JSON.stringify({
+        accuracy: acc, accuracyAll: accAll, recent,
+        activeStrategy: ACTIVE_STRATEGY,
+      }), {
         status: 200,
         headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders },
       });
