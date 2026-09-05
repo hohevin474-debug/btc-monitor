@@ -350,8 +350,22 @@ function strategyV2(candles, p = {}) {
   const rsi = calcRSI(closes, 14);
   const rsiMomentum = (rsi - 50) / 50;   // +1 表示强动量，-1 表示弱
 
+  // 过热衰减：动量绝对值超过 momCap(%) 后线性衰减，到 momKill(%) 归零。
+  // 动机 —— 实盘 2026-09-04 的教训：BTC 24H 急涨到 81,300（局部顶），
+  // 动量分量早已饱和（±2% 即打满），score 冲到 0.9 发出强 LONG，
+  // 结果 6H 后跌到 79,729，单笔亏 1570 点。
+  // 动量的信息在趋势中段最有效，到了急涨/急跌末端反而是反转风险最高的位置。
+  let momTerm = clamp(mom / (p.momScale ?? 2), -1, 1);
+  if (p.momCap) {
+    const a = Math.abs(mom);
+    const kill = p.momKill ?? p.momCap * 2;
+    if (a > p.momCap && kill > p.momCap) {
+      momTerm *= Math.max(0, 1 - (a - p.momCap) / (kill - p.momCap));
+    }
+  }
+
   let score = 0;
-  score += clamp(mom / (p.momScale ?? 2), -1, 1) * (p.wMom ?? 0.35);
+  score += momTerm * (p.wMom ?? 0.35);
   score += clamp(trendScore / (p.trendScale ?? 0.5), -1, 1) * (p.wTrend ?? 0.2);
   score += rsiMomentum * (p.wRsi ?? 0.1);
   if (breakUp) score += (p.wBreak ?? 0.25);

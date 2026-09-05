@@ -132,6 +132,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Micr
 <div class="reasons-container" id="reasonsBox"><span style="color:var(--sub)">正在加载...</span></div>
 </div>
 <div class="card" style="grid-column:1/-1">
+<div class="card-header"><span class="card-title">🩺 系统状态</span><span style="font-size:.75em;color:var(--sub)" id="healthNote">加载中...</span></div>
+<div id="healthBox" style="font-size:.85em;line-height:1.9"></div>
+<div style="margin-top:4px;font-size:.72em;color:var(--sub)">长时间没收到推送不一定是故障：波动率不足或信号强度不够时系统会主动静默。看这里能区分「系统挂了」和「系统在等行情」。</div>
+</div>
+<div class="card" style="grid-column:1/-1">
 <div class="card-header"><span class="card-title">🎯 真实回测准确率</span><span style="font-size:.75em;color:var(--sub)" id="btTotal">加载中...</span></div>
 <div style="overflow-x:auto"><table class="sig-table"><thead><tr><th>验证窗口</th><th>样本数</th><th>方向准确率</th><th>终点达标率</th><th>过程机会率</th><th>平均最大盈利</th><th>平均最大亏损</th></tr></thead><tbody id="btBody"><tr><td colspan="7" style="text-align:center;color:var(--sub);padding:20px">加载中...</td></tr></tbody></table></div>
 <div style="margin-top:6px;font-size:.72em;color:var(--sub)">终点达标率 = 窗口<b>结束</b>时达到500点 ｜ 过程机会率 = 窗口内<b>曾经出现</b>过500点有利波动，更真实反映可捕捉的盈利空间</div>
@@ -234,6 +239,36 @@ document.getElementById('bbMid').textContent='$'+(s.bb_middle||0).toLocaleString
 document.getElementById('bbLow').textContent='$'+(s.bb_lower||0).toLocaleString();
 document.getElementById('bbWidth').textContent=(s.bb_width||0).toFixed(2)+'%';
 document.getElementById('maVals').textContent='$'+(s.ma5||0).toFixed(0)+' / $'+(s.ma10||0).toFixed(0)+' / $'+(s.ma20||0).toFixed(0);
+// ---- 系统状态：区分「系统挂了」和「系统在等行情」 ----
+(function(){
+let hb=document.getElementById('healthBox');if(!hb)return;
+let now=Date.now();
+let beatMs=now-(d.last_update||now);
+let alive=beatMs<180000;                       // 2 分钟内有更新 = 存活
+let beatTxt=beatMs<60000?'刚刚':Math.floor(beatMs/60000)+' 分钟前';
+let hist=d.history||[];
+let last=hist.length?hist[hist.length-1]:null;
+let pushTxt='从未推送';
+let pushCls='var(--sub)';
+if(last){
+let gapH=(now/1000-last.time)/3600;
+pushTxt=last.direction+' @ $'+Number(last.price).toLocaleString()+' · '+
+(gapH<1?Math.max(1,Math.round(gapH*60))+' 分钟前':gapH.toFixed(1)+' 小时前');
+pushCls=gapH>6?'#ffb020':'var(--green)';
+}
+let src=(d.probe||[]).map(p=>p.name+(p.ok?'✓ '+(p.ms||0)+'ms':'✗')).join(' / ')||(d.source_name||'--');
+let rows=[
+['Worker 心跳', alive?'<b style="color:var(--green)">正常</b> · '+beatTxt:'<b style="color:var(--red)">异常</b> · '+beatTxt+' 未更新'],
+['数据源', src],
+['K 线缓存', (d.klines_count||0)+' 根'],
+['上次推送', '<span style="color:'+pushCls+'">'+pushTxt+'</span>'],
+['当前信号', dir==='WAIT'?'⚪ 观望（主动静默，非故障）':(dir==='LONG'?'🟢 做多':'🔴 做空')],
+['静默原因', dir==='WAIT'?((s.reasons||[]).join('；')||'信号强度不足'):'—'],
+['24H 波幅', Math.round((d.high_24h||0)-(d.low_24h||0))+' 点'],
+];
+hb.innerHTML=rows.map(r=>'<div style="display:flex;gap:10px"><span style="color:var(--sub);min-width:76px;display:inline-block">'+r[0]+'</span><span>'+r[1]+'</span></div>').join('');
+document.getElementById('healthNote').textContent=alive?'运行中':'⚠ 心跳超时';
+})();
 let re=document.getElementById('reasonsBox');
 if(s.reasons&&s.reasons.length){
 re.innerHTML=s.reasons.map(x=>{
