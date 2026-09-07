@@ -481,16 +481,22 @@ function analyzeV2(klines, price) {
   const baseMove24 = 0.7979 * sigma24;
   const predictedMove = baseMove24 * (1 + Math.abs(score) * 0.3);
 
+  // 趋势持续性假设：信号越强，方向漂移越大。
+  // 注意 mu 取正值 —— 方向已由 direction 表达，这里算的是
+  // "朝有利方向" 移动 500 点的概率，不应再乘符号（否则做空概率会被低估）。
+  const mu = sigma24 * V2.driftStrength * Math.min(1, Math.abs(score) / V2.driftRef);
+  const z = (BIG_MOVE_POINTS - mu) / sigma24;
+  // P(朝有利方向移动 ≥ BIG_MOVE_POINTS 点)
+  const probAtCurrentScore = 1 - normalCDF(z);
+
   let probability = 0;
   if (direction !== 'WAIT') {
-    // 趋势持续性假设：信号越强，方向漂移越大。
-    // 注意 mu 取正值 —— 方向已由 direction 表达，这里算的是
-    // "朝有利方向" 移动 500 点的概率，不应再乘符号（否则做空概率会被低估）。
-    const mu = sigma24 * V2.driftStrength * Math.min(1, Math.abs(score) / V2.driftRef);
-    const z = (BIG_MOVE_POINTS - mu) / sigma24;
-    // P(朝有利方向移动 ≥ BIG_MOVE_POINTS 点)
-    probability = 1 - normalCDF(z);
+    probability = probAtCurrentScore;
   }
+  // WAIT 时 probability 恒为 0，直接显示会让人误以为"第三关也卡住"。
+  // 实际上概率关是三关里最宽松的一道（历史上只拦掉 2.7% 的信号），
+  // 它只是"没出方向所以没算"。这里给出参考值，便于判断一旦触发会怎样。
+  const probRef = +probAtCurrentScore.toFixed(3);
 
   return {
     direction,
@@ -514,7 +520,13 @@ function analyzeV2(klines, price) {
     gates: {
       atr:   { v: +atrPct.toFixed(3),    need: V2.minAtrPct,   pass: atrPct >= V2.minAtrPct },
       score: { v: +Math.abs(score).toFixed(3), need: V2.threshold, pass: Math.abs(score) >= V2.threshold },
-      prob:  { v: +probability.toFixed(3), need: PUSH_MIN_PROB, pass: probability >= PUSH_MIN_PROB },
+      prob:  {
+        v: (direction !== 'WAIT') ? +probability.toFixed(3) : probRef,
+        need: PUSH_MIN_PROB,
+        pass: (direction !== 'WAIT') ? probability >= PUSH_MIN_PROB : probRef >= PUSH_MIN_PROB,
+        // WAIT 时这是"若触发则是多少"的参考值，不是真实概率
+        estimated: direction === 'WAIT',
+      },
     },
   };
 }

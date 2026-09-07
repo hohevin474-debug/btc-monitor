@@ -253,8 +253,9 @@ var need=typeof o.need==='number'?o.need:0;
 var ok=!!o.pass;
 var col=ok?'var(--green)':'var(--red)';
 var op=ok?'≥':'<';
+var est=o.estimated?'<span style="color:var(--sub);font-size:.9em">（若触发）</span>':'';
 return '<span style="color:'+col+'" title="'+n+' 实际 '+v+'，门槛 '+need+'">'+
-n+' '+v+op+need+' '+(ok?'✓':'✗')+'</span>';
+n+' '+(o.estimated?'~':'')+v+op+need+' '+(ok?'✓':'✗')+est+'</span>';
 }).join(' <span style="color:var(--sub)">·</span> ');
 }
 // ---- 系统状态：区分「系统挂了」和「系统在等行情」 ----
