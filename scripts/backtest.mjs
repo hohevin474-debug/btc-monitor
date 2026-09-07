@@ -254,7 +254,7 @@ function strategyMomentum(candles, p = {}) {
   const ret = (price - past) / past * 100;
 
   // 成交量确认：近期均量 vs 更早均量
-  const vols = candles.map(c => c.vol);
+  const vols = candles.map(c => (c.vol ?? c.v ?? 0));  // 兼容 vol/v 两种字段名
   const volNow = sma(vols.slice(-n), n);
   const volPrev = sma(vols.slice(-n * 2, -n), n);
   const volRatio = volPrev > 0 ? volNow / volPrev : 1;
@@ -341,7 +341,7 @@ function strategyV2(candles, p = {}) {
   const breakDown = price < ll;
 
   // 成交量确认
-  const vols = candles.map(c => c.vol);
+  const vols = candles.map(c => (c.vol ?? c.v ?? 0));  // 兼容 vol/v 两种字段名
   const volNow = sma(vols.slice(-12), 12);
   const volPrev = sma(vols.slice(-24, -12), 12);
   const volRatio = volPrev > 0 ? volNow / volPrev : 1;
