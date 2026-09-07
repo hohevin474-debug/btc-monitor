@@ -239,6 +239,24 @@ document.getElementById('bbMid').textContent='$'+(s.bb_middle||0).toLocaleString
 document.getElementById('bbLow').textContent='$'+(s.bb_lower||0).toLocaleString();
 document.getElementById('bbWidth').textContent=(s.bb_width||0).toFixed(2)+'%';
 document.getElementById('maVals').textContent='$'+(s.ma5||0).toFixed(0)+' / $'+(s.ma10||0).toFixed(0)+' / $'+(s.ma20||0).toFixed(0);
+// ---- 推送三重门槛体检 ----
+// 系统要推送必须同时满足：波动率足够 / 信号强度达标 / 500点概率达标。
+// 三者任一不过都会静默，过去只能靠人工拉数据复算才知道卡在哪。
+// 这里把三关的实际值与门槛值并排显示，卡关一眼可见。
+function gateHtml(g){
+if(!g||!g.atr)return '<span style="color:var(--sub)">—（旧版本无此数据）</span>';
+var defs=[['波动率',g.atr],['强度',g.score],['概率',g.prob]];
+return defs.map(function(x){
+var n=x[0],o=x[1]||{};
+var v=typeof o.v==='number'?o.v:0;
+var need=typeof o.need==='number'?o.need:0;
+var ok=!!o.pass;
+var col=ok?'var(--green)':'var(--red)';
+var op=ok?'≥':'<';
+return '<span style="color:'+col+'" title="'+n+' 实际 '+v+'，门槛 '+need+'">'+
+n+' '+v+op+need+' '+(ok?'✓':'✗')+'</span>';
+}).join(' <span style="color:var(--sub)">·</span> ');
+}
 // ---- 系统状态：区分「系统挂了」和「系统在等行情」 ----
 (function(){
 let hb=document.getElementById('healthBox');if(!hb)return;
@@ -263,6 +281,7 @@ let rows=[
 ['K 线缓存', (d.klines_count||0)+' 根'],
 ['上次推送', '<span style="color:'+pushCls+'">'+pushTxt+'</span>'],
 ['当前信号', dir==='WAIT'?'⚪ 观望（主动静默，非故障）':(dir==='LONG'?'🟢 做多':'🔴 做空')],
+['推送三关', gateHtml(s.gates)],
 ['静默原因', dir==='WAIT'?((s.reasons||[]).join('；')||'信号强度不足'):'—'],
 ['24H 波幅', Math.round((d.high_24h||0)-(d.low_24h||0))+' 点'],
 ];

@@ -399,9 +399,14 @@ const V2 = {
 };
 
 function analyzeV2(klines, price) {
-  const blank = (reason) => ({
+  // gates：推送三重门槛的实时体检数据。
+  // 教训（2026-09-07）：连续 58 小时零推送，排查时才发现系统有 ATR / 强度 / 概率
+  // 三道独立门槛，任何一道不过都会静默。此前面板只显示"信号=观望"，
+  // 无法区分是卡在哪一关，只能靠人工拉数据复算。这里把三关的数值和门槛一起吐出来。
+  const blank = (reason, gates) => ({
     direction: 'WAIT', probability: 0, confidence: 0, predicted_move: 0,
     score: 0, reasons: [reason], atr: 0, atrPct: 0, targetHorizon: 24,
+    ...(gates ? { gates } : {}),
   });
 
   if (!klines || klines.length < 60) return blank('⏳ K线数据积累中...');
@@ -412,7 +417,11 @@ function analyzeV2(klines, price) {
 
   // 波动率门槛：市场太安静时 500 点目标不现实，直接不发信号
   if (atrPct < V2.minAtrPct) {
-    return { ...blank(`😴 波动率不足 (ATR ${atrPct.toFixed(2)}% < ${V2.minAtrPct}%)，不满足500点条件`),
+    return { ...blank(`😴 波动率不足 (ATR ${atrPct.toFixed(2)}% < ${V2.minAtrPct}%)，不满足500点条件`, {
+        atr:   { v: +atrPct.toFixed(3), need: V2.minAtrPct, pass: false },
+        score: { v: 0, need: V2.threshold, pass: false },
+        prob:  { v: 0, need: PUSH_MIN_PROB, pass: false },
+      }),
       atr, atrPct };
   }
 
@@ -501,6 +510,12 @@ function analyzeV2(klines, price) {
     sigma24: Math.round(sigma24),
     targetHorizon: 24,        // 明确标注目标窗口是 24 小时
     strategy: 'v2',
+    // 推送三重门槛体检：三关全 pass 才会推送
+    gates: {
+      atr:   { v: +atrPct.toFixed(3),    need: V2.minAtrPct,   pass: atrPct >= V2.minAtrPct },
+      score: { v: +Math.abs(score).toFixed(3), need: V2.threshold, pass: Math.abs(score) >= V2.threshold },
+      prob:  { v: +probability.toFixed(3), need: PUSH_MIN_PROB, pass: probability >= PUSH_MIN_PROB },
+    },
   };
 }
 
