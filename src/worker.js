@@ -37,7 +37,14 @@ const PUSH_MIN_PROB_V2 = 0.35;
 const PUSH_MIN_PROB = ACTIVE_STRATEGY === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
 
 // 同一策略记录回测样本的最小间隔（秒）
-const BT_RECORD_INTERVAL = 1800;   // 30 分钟
+const BT_RECORD_INTERVAL = 1800;   // 30 分钟：方向刚变化时用，保证新信号立刻留痕
+// 同方向持续期间的采样间隔。
+// 教训（2026-09-11）：之前无论方向是否变化都按 30 分钟记一条，
+// 结果一波持续 10 小时的行情被拆成 20 条"样本"，它们的 24H 结果几乎必然同对错，
+// 却各自独立计入准确率 —— 长行情被放大 20 倍权重，短行情只有 1 倍。
+// 实盘 146 条记录里真正的独立信号段只有个位数，准确率被严重扭曲。
+// 同方向改为 6 小时记一次：24H 窗口内最多 4 条重叠，而不是 48 条。
+const BT_SEGMENT_INTERVAL = 6 * 3600;
 
 // 暂停开关：true = 暂停推送（系统继续记录价格，但不发 Bark）
 // 恢复推送时改为 false 并重新部署
@@ -676,7 +683,29 @@ function mfeMae(rec, horizon) {
 }
 
 // 统计准确率
+/**
+ * 按「独立信号段」去重。
+ * 同一策略、同一方向、且间隔 < gapSec 的记录，属于同一波行情的重复采样 ——
+ * 它们的 24H 结果几乎必然同对错，各自独立计入会把长行情放大几十倍权重。
+ * 只保留每段第一条。
+ */
+function dedupeSegments(records, gapSec = 6 * 3600) {
+  const sorted = [...records].sort((a, b) => a.time - b.time);
+  const out = [];
+  let last = null;
+  for (const r of sorted) {
+    if (last && (last.strategy || 'v1') === (r.strategy || 'v1')
+        && last.direction === r.direction
+        && (r.time - last.time) < gapSec) continue;
+    out.push(r);
+    last = r;
+  }
+  return out;
+}
+
 function computeAccuracy(records, target = BIG_MOVE_POINTS) {
+  // 先按独立信号段去重，再做统计 —— 否则重复采样会主导结果
+  records = dedupeSegments(records);
   const stat = (field, label, pool = records) => {
     const list = pool.filter(r => r[field] !== null);
     if (!list.length) {
@@ -909,8 +938,13 @@ async function fetchAndAnalyze(env) {
     const minProb = tag === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
     if ((sig.probability || 0) < minProb) continue;
     const lastKey = `last_bt_${tag}`;
-    if (nowSec - (state[lastKey] || 0) < BT_RECORD_INTERVAL) continue;
+    const lastDirKey = `last_bt_dir_${tag}`;
+    // 方向延续 = 同一波行情的重复采样，用更长的间隔；方向刚变 = 新信号，立刻记
+    const sameDir = state[lastDirKey] === sig.direction;
+    const interval = sameDir ? BT_SEGMENT_INTERVAL : BT_RECORD_INTERVAL;
+    if (nowSec - (state[lastKey] || 0) < interval) continue;
     state[lastKey] = nowSec;
+    state[lastDirKey] = sig.direction;
     await recordSignal(env, sig, newPrice, now, tag);
   }
 
