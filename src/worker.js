@@ -394,6 +394,20 @@ const V2 = {
   //   跟「趋势突破 +1141」是同一个坑：追全量峰值 = 过拟合。改取 0.45。
   //   另注：准确率几乎不随阈值变化（49.1%~49.5%），变的是赔率结构。
   threshold: 0.45,
+  // 趋势强度门槛（ADX）。2026-09-11 上线，动机：
+  //   实盘 24H 准确率只有 26.7%，但全量回测 48.3% —— 差异来自行情段。
+  //   按 2 周切 20 段，13 段为负；当前段（08-21 起）准确率仅 17.6%。
+  //   失败模式很一致：跌了做空然后反弹，涨了做多然后回落 —— 趋势跟随
+  //   在方向反复的震荡市里必然反复被打脸。
+  //   6940 根回测（只在 ADX>=X 时开仓）：
+  //     无过滤 → 交易253 胜率43.9% 期望 −57  负段 13/20
+  //     ADX≥25 → 交易174 胜率50.6% 期望 +40  负段  9/20
+  //     ADX≥30 → 交易120 胜率50.8% 期望 +82  负段 10/20
+  //   选 25 不是网格搜索挑出来的 —— 它是 Wilder 原书的标准分界，有先验依据。
+  //   ⚠️ 诚实提醒：ADX 救不了最近这段（该段期望 +126 → −984）。当前市场是
+  //   高 ADX 的震荡，波动大但方向反复，ADX 区分不了。它改善的是长期统计。
+  minAdx: 25,
+  adxPeriod: 14,
   // 概率模型的归一化基准，与信号阈值解耦。
   // 若直接用 threshold 归一化：任何通过门槛的信号都有 |score| >= threshold，
   // 于是 min(1, |score|/threshold) 恒等于 1，趋势项不再提供任何区分度，
@@ -404,6 +418,56 @@ const V2 = {
   driftStrength: 0.3,   // 趋势持续性假设（用于概率模型，保守取值）
   atrToSigma: 1.3,      // ATR → σ 的经验换算系数
 };
+
+/**
+ * Wilder ADX（平均趋向指数）—— 衡量趋势强度，与方向无关。
+ * 0~25 通常视为无趋势/震荡，25 以上视为有趋势。
+ *
+ * ⚠️ 实现踩过的坑：RMA（Wilder 平滑）有两处必须带 /n ——
+ *   ① 首值要取前 n 项【平均】而不是【和】
+ *   ② 递推是 prev = (prev*(n−1) + x)/n
+ *   漏掉任何一处 ADX 都会放大约 n 倍。我第一版就是这么错的：
+ *   ADX 值域跑到 35~1055（中位数 348），导致所有门槛都形同虚设。
+ */
+function calcADX(candles, n = 14) {
+  if (!candles || candles.length < n * 2 + 2) return null;
+  const tr = [], pdm = [], ndm = [];
+  for (let i = 1; i < candles.length; i++) {
+    const h = candles[i].h, l = candles[i].l;
+    const pc = candles[i - 1].c, ph = candles[i - 1].h, pl = candles[i - 1].l;
+    tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+    const up = h - ph, dn = pl - l;
+    pdm.push(up > dn && up > 0 ? up : 0);
+    ndm.push(dn > up && dn > 0 ? dn : 0);
+  }
+  const rma = (a, n) => {
+    const out = new Array(a.length).fill(NaN);
+    if (a.length < n) return out;
+    let prev = 0;
+    for (let i = 0; i < n; i++) prev += a[i];
+    prev /= n;                                  // ① 必须是平均
+    out[n - 1] = prev;
+    for (let i = n; i < a.length; i++) {        // ② 递推带 /n
+      prev = (prev * (n - 1) + a[i]) / n;
+      out[i] = prev;
+    }
+    return out;
+  };
+  const atrS = rma(tr, n), pS = rma(pdm, n), nS = rma(ndm, n);
+  const dx = [];
+  for (let i = n - 1; i < tr.length; i++) {
+    if (!atrS[i] || !isFinite(atrS[i])) continue;
+    const pdi = 100 * pS[i] / atrS[i], ndi = 100 * nS[i] / atrS[i];
+    const den = pdi + ndi;
+    dx.push(den > 0 ? 100 * Math.abs(pdi - ndi) / den : 0);
+  }
+  if (dx.length < n) return null;
+  let adx = 0;
+  for (let i = 0; i < n; i++) adx += dx[i];
+  adx /= n;
+  for (let i = n; i < dx.length; i++) adx = (adx * (n - 1) + dx[i]) / n;
+  return adx;
+}
 
 function analyzeV2(klines, price) {
   // gates：推送三重门槛的实时体检数据。
@@ -426,10 +490,24 @@ function analyzeV2(klines, price) {
   if (atrPct < V2.minAtrPct) {
     return { ...blank(`😴 波动率不足 (ATR ${atrPct.toFixed(2)}% < ${V2.minAtrPct}%)，不满足500点条件`, {
         atr:   { v: +atrPct.toFixed(3), need: V2.minAtrPct, pass: false },
+        trend: { v: null, need: V2.minAdx, pass: false },
         score: { v: 0, need: V2.threshold, pass: false },
         prob:  { v: 0, need: PUSH_MIN_PROB, pass: false },
       }),
       atr, atrPct };
+  }
+
+  // 趋势强度门槛：ADX 低 = 震荡市，趋势跟随会被反复打脸
+  const adx = calcADX(klines, V2.adxPeriod);
+  const adxNum = adx === null ? null : +adx.toFixed(1);
+  if (V2.minAdx && adx !== null && adx < V2.minAdx) {
+    return { ...blank(`📊 趋势强度不足 (ADX ${adx.toFixed(0)} < ${V2.minAdx})，震荡市不参与`, {
+        atr:   { v: +atrPct.toFixed(3), need: V2.minAtrPct, pass: true },
+        trend: { v: adxNum, need: V2.minAdx, pass: false },
+        score: { v: 0, need: V2.threshold, pass: false },
+        prob:  { v: 0, need: PUSH_MIN_PROB, pass: false },
+      }),
+      atr, atrPct, adx: adxNum };
   }
 
   const reasons = [];
@@ -523,9 +601,11 @@ function analyzeV2(klines, price) {
     sigma24: Math.round(sigma24),
     targetHorizon: 24,        // 明确标注目标窗口是 24 小时
     strategy: 'v2',
-    // 推送三重门槛体检：三关全 pass 才会推送
+    adx: adxNum,
+    // 推送门槛体检：全部 pass 才会推送（2026-09-11 起为四关，新增趋势强度）
     gates: {
       atr:   { v: +atrPct.toFixed(3),    need: V2.minAtrPct,   pass: atrPct >= V2.minAtrPct },
+      trend: { v: adxNum, need: V2.minAdx, pass: adxNum !== null && adxNum >= V2.minAdx },
       score: { v: +Math.abs(score).toFixed(3), need: V2.threshold, pass: Math.abs(score) >= V2.threshold },
       prob:  {
         v: (direction !== 'WAIT') ? +probability.toFixed(3) : probRef,

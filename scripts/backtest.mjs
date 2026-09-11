@@ -133,6 +133,48 @@ function calcATR(candles, period = 14) {
   return sum / period;
 }
 
+/**
+ * Wilder ADX —— 与 worker.js 的 calcADX 同实现，改动请同步两边。
+ * ⚠️ RMA 两处必须带 /n：① 首值取前 n 项平均（不是和）② 递推 (prev*(n−1)+x)/n。
+ *    漏掉任一处 ADX 会放大约 n 倍（第一版就踩了，值域跑到 35~1055）。
+ */
+function calcADX(candles, n = 14) {
+  if (!candles || candles.length < n * 2 + 2) return null;
+  const tr = [], pdm = [], ndm = [];
+  for (let i = 1; i < candles.length; i++) {
+    const h = candles[i].h, l = candles[i].l;
+    const pc = candles[i - 1].c, ph = candles[i - 1].h, pl = candles[i - 1].l;
+    tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+    const up = h - ph, dn = pl - l;
+    pdm.push(up > dn && up > 0 ? up : 0);
+    ndm.push(dn > up && dn > 0 ? dn : 0);
+  }
+  const rma = (a, n) => {
+    const out = new Array(a.length).fill(NaN);
+    if (a.length < n) return out;
+    let prev = 0;
+    for (let i = 0; i < n; i++) prev += a[i];
+    prev /= n;
+    out[n - 1] = prev;
+    for (let i = n; i < a.length; i++) { prev = (prev * (n - 1) + a[i]) / n; out[i] = prev; }
+    return out;
+  };
+  const atrS = rma(tr, n), pS = rma(pdm, n), nS = rma(ndm, n);
+  const dx = [];
+  for (let i = n - 1; i < tr.length; i++) {
+    if (!atrS[i] || !isFinite(atrS[i])) continue;
+    const pdi = 100 * pS[i] / atrS[i], ndi = 100 * nS[i] / atrS[i];
+    const den = pdi + ndi;
+    dx.push(den > 0 ? 100 * Math.abs(pdi - ndi) / den : 0);
+  }
+  if (dx.length < n) return null;
+  let adx = 0;
+  for (let i = 0; i < n; i++) adx += dx[i];
+  adx /= n;
+  for (let i = n; i < dx.length; i++) adx = (adx * (n - 1) + dx[i]) / n;
+  return adx;
+}
+
 function sma(arr, n) {
   if (arr.length < n) return arr.reduce((a, b) => a + b, 0) / arr.length;
   return arr.slice(-n).reduce((a, b) => a + b, 0) / n;
@@ -321,6 +363,13 @@ function strategyV2(candles, p = {}) {
 
   // 波动率门槛：太安静的市不参与（500 点目标不现实）
   if (atrPct < (p.minAtrPct ?? 0.25)) return { dir: 'WAIT', strength: 0, score: 0 };
+
+  // 趋势强度门槛（ADX）：默认关闭，需显式传 minAdx 才启用。
+  // 与 worker.js 的 calcADX 保持一致，否则离线校准会和实盘对不上。
+  if (p.minAdx) {
+    const adx = calcADX(candles, p.adxPeriod || 14);
+    if (adx !== null && adx < p.minAdx) return { dir: 'WAIT', strength: 0, score: 0 };
+  }
 
   // 动量（主权重）：过去 N 根收益率
   const momN = p.momPeriod || 24;
@@ -677,7 +726,7 @@ if (process.env.BT_LIB !== '1') {
 
 export {
   runBacktest, gridSearch, summarize, STRATEGIES,
-  calcRSI, calcEMA, calcMACD, calcBB, calcATR, sma,
+  calcRSI, calcEMA, calcMACD, calcBB, calcATR, calcADX, sma,
   strategyMeanReversion, strategyBreakout, strategySqueeze,
   strategyMomentum, strategyTrendPullback, strategyV2, strategyV2Squeeze,
   fetchCandles,
