@@ -762,6 +762,36 @@ function mfeMae(rec, horizon) {
   return { mfe: p - lo, mae: p - hi };     // 做空：跌为有利
 }
 
+/**
+ * 战绩汇总：把记录折算成真实盈亏。
+ * ⚠️ 关键：h24 是「终点价格」不是盈亏。做空赚钱时 h24 < price，
+ *    直接拿 (h24 - price) 求和算的是市场漂移，不是策略收益。
+ *    必须按方向折算：SHORT 用 price - h24，LONG 用 h24 - price。
+ */
+function summarizePnl(records, horizon = 'h24') {
+  const list = records.filter(r => r[horizon] !== null && r[horizon] !== undefined);
+  if (!list.length) return null;
+  const pnls = list.map(r => (r.direction === 'SHORT' ? r.price - r[horizon] : r[horizon] - r.price));
+  const wins = pnls.filter(p => p > 0);
+  const losses = pnls.filter(p => p <= 0);
+  const sumW = wins.reduce((a, b) => a + b, 0);
+  const sumL = losses.reduce((a, b) => a + b, 0);
+  return {
+    horizon,
+    n: list.length,
+    total: Math.round(pnls.reduce((a, b) => a + b, 0)),
+    winRate: +(wins.length / list.length * 100).toFixed(1),
+    wins: wins.length, losses: losses.length,
+    avg: Math.round(pnls.reduce((a, b) => a + b, 0) / list.length),
+    avgWin: wins.length ? Math.round(sumW / wins.length) : 0,
+    avgLoss: losses.length ? Math.round(sumL / losses.length) : 0,
+    best: Math.round(Math.max(...pnls)),
+    worst: Math.round(Math.min(...pnls)),
+    // 盈亏比：总盈利 / 总亏损。< 1 意味着赚的比亏的少
+    pf: sumL < 0 ? +(sumW / -sumL).toFixed(2) : null,
+  };
+}
+
 // 统计准确率
 /**
  * 按「独立信号段」去重。
@@ -1185,17 +1215,29 @@ export default {
       const acc = computeAccuracy(activeRecords);
       // 全量统计保留，供 A/B 对比卡片使用
       const accAll = computeAccuracy(records);
-      // 附带最近 20 条明细，便于核查
-      const recent = records.slice(-20).map(r => ({
-        time: r.time,
-        direction: r.direction,
-        price: r.price,
-        prob: r.probability,
-        h1: r.h1, h6: r.h6, h24: r.h24,
-        done: r.done,
-      }));
+      // 战绩：按独立信号段去重后的真实盈亏（24H 窗口）
+      const pnl = summarizePnl(dedupeSegments(activeRecords));
+      const pnl6 = summarizePnl(dedupeSegments(activeRecords), 'h6');
+      // 附带最近明细，limit 可放大（默认 20）
+      const lim = Math.min(500, parseInt(url.searchParams.get('limit') || '20', 10));
+      const recent = records.slice(-lim).map(r => {
+        const o = {
+          time: r.time, strategy: r.strategy || 'v1', direction: r.direction,
+          price: r.price, prob: r.probability,
+          h1: r.h1, h6: r.h6, h24: r.h24, done: r.done,
+        };
+        // 逐笔盈亏（按方向折算，见 summarizePnl 的说明）
+        for (const h of ['h1', 'h6', 'h24']) {
+          const f = r[h];
+          o['pnl_' + h] = (f === null || f === undefined) ? null
+            : Math.round(r.direction === 'SHORT' ? r.price - f : f - r.price);
+        }
+        const mm = mfeMae(r, 'h24');
+        if (mm) { o.mfe24 = Math.round(mm.mfe); o.mae24 = Math.round(mm.mae); }
+        return o;
+      });
       return new Response(JSON.stringify({
-        accuracy: acc, accuracyAll: accAll, recent,
+        accuracy: acc, accuracyAll: accAll, recent, pnl, pnl6,
         activeStrategy: ACTIVE_STRATEGY,
       }), {
         status: 200,
