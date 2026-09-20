@@ -21,6 +21,16 @@ const BARK_COOLDOWN = 180; // 同一方向信号最小间隔（秒）
 // 分级推送阈值：预判波幅达到该点数视为"重大行情"，用最高优先级推送并忽略冷却
 const BIG_MOVE_POINTS = 500;
 
+// plan A ①③：持仓管理常量（非重叠持仓 + 止损 / 移动止损）
+// 单笔持仓最多持有 24H（与策略目标窗口一致），期间不再开新仓 —— 对应回测
+// 「口径 B 非重叠」盈亏比从 1.06 升到 2.73 的核心改进（频率是主因）。
+const V2_POSITION_HOLD_SEC = 24 * 3600;
+// 止损距离 = ATR% × 倍数，再夹在 [下限, 上限] 之间（占价百分比）。
+// 动机：实盘 MAE(最大不利波动) 1315 ≫ MFE 871，亏时扛太久。止损把单笔最大亏损截断。
+const V2_STOP_MULT = 1.5;
+const V2_STOP_MIN_PCT = 1.2;
+const V2_STOP_MAX_PCT = 3.0;
+
 // 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（新）
 // 两者始终并行计算并同时记录回测样本，此开关只决定推送哪一个。
 // 之所以并行：沙箱拿不到历史 K 线，无法离线回测，改用实盘 A/B 对比验证。
@@ -393,7 +403,16 @@ const V2 = {
   //   0.50 全量期望最高（+130）却有 2 段为负；0.45 期望 +98 但只有 1 段为负。
   //   跟「趋势突破 +1141」是同一个坑：追全量峰值 = 过拟合。改取 0.45。
   //   另注：准确率几乎不随阈值变化（49.1%~49.5%），变的是赔率结构。
-  threshold: 0.45,
+  threshold: 0.45,          // 做空基线阈值（SHORT 用，同时作为面板显示基线）
+  // 非对称阈值（plan A ②，2026-09-18 上线）：做多更严。
+  // 实盘 29 笔做多亏了 88%（逆势做多主因）。回测（非重叠 + ADX≥25）：
+  //   LONG 0.45/SHORT 0.45 → LONG 均值 +627
+  //   LONG 0.60/SHORT 0.45 → LONG 均值 +1072，整体 +828，盈亏比 4.03
+  thresholdLong: 0.60,      // 做多门槛提高，过滤弱做多信号
+  thresholdShort: 0.45,     // 做空门槛
+  // 趋势对齐过滤（plan A ③）：只在均线趋势方向一致时开仓，杜绝逆势做多。
+  // 做多需 maFast>maSlow（多头排列），做空需 maFast<maSlow（空头排列）。
+  requireTrendAlign: true,
   // 趋势强度门槛（ADX）。2026-09-11 上线，动机：
   //   实盘 24H 准确率只有 26.7%，但全量回测 48.3% —— 差异来自行情段。
   //   按 2 周切 20 段，13 段为负；当前段（08-21 起）准确率仅 17.6%。
@@ -555,8 +574,21 @@ function analyzeV2(klines, price) {
   }
 
   let direction = 'WAIT';
-  if (score > V2.threshold) direction = 'LONG';
-  else if (score < -V2.threshold) direction = 'SHORT';
+  const thrLong = V2.thresholdLong ?? V2.threshold;
+  const thrShort = V2.thresholdShort ?? V2.threshold;
+  if (score > thrLong) direction = 'LONG';
+  else if (score < -thrShort) direction = 'SHORT';
+
+  // 趋势对齐过滤（plan A ③）：方向必须与均线趋势一致，否则不逆势开仓。
+  // 直接针对实盘病灶：LONG 贡献了 88% 的亏损，且主要发生在当前下跌趋势里追多。
+  if (V2.requireTrendAlign && direction !== 'WAIT') {
+    const aligned = (direction === 'LONG' && trend === 'up')
+                 || (direction === 'SHORT' && trend === 'down');
+    if (!aligned) {
+      direction = 'WAIT';
+      reasons.push('⛔ 趋势未对齐，不逆势开仓');
+    }
+  }
 
   // ---- 波动预测与概率（基于统计模型，非拍脑袋公式）----
   // σ_1H 由 ATR 换算，再按 sqrt(24) 外推到 24 小时
@@ -606,7 +638,11 @@ function analyzeV2(klines, price) {
     gates: {
       atr:   { v: +atrPct.toFixed(3),    need: V2.minAtrPct,   pass: atrPct >= V2.minAtrPct },
       trend: { v: adxNum, need: V2.minAdx, pass: adxNum !== null && adxNum >= V2.minAdx },
-      score: { v: +Math.abs(score).toFixed(3), need: V2.threshold, pass: Math.abs(score) >= V2.threshold },
+      score: {
+        v: +Math.abs(score).toFixed(3),
+        need: direction === 'LONG' ? thrLong : thrShort,
+        pass: direction === 'LONG' ? score > thrLong : Math.abs(score) >= thrShort,
+      },
       prob:  {
         v: (direction !== 'WAIT') ? +probability.toFixed(3) : probRef,
         need: PUSH_MIN_PROB,
@@ -616,6 +652,47 @@ function analyzeV2(klines, price) {
       },
     },
   };
+}
+
+// ============================================================
+// 持仓管理（plan A ①③）：非重叠持仓 + 止损 / 移动止损 + 24H 到期
+// 每周期调用一次：更新移动止损、检测止损/到期离场。
+// 一笔持仓在离场前阻止新的同向开仓（非重叠），直接对应回测
+// 「口径 B 非重叠」盈亏比 1.06 → 2.73 的改进。止损把实盘 MAE 1315 的巨亏截断。
+// ============================================================
+async function managePosition(env, state, price, nowSec) {
+  const pos = state.open_pos;
+  if (!pos) return false;
+
+  const isLong = pos.dir === 'LONG';
+  // 移动止损：跟踪极值，有利方向移动后上移止损，只收紧不放松
+  pos.best = isLong ? Math.max(pos.best, price) : Math.min(pos.best, price);
+  const sp = pos.stopPct;
+  pos.stop = isLong ? Math.max(pos.stop, pos.best * (1 - sp / 100))
+                    : Math.min(pos.stop, pos.best * (1 + sp / 100));
+
+  let exit = null;
+  if (isLong && price <= pos.stop) exit = { kind: '止损', pnl: price - pos.entry };
+  else if (!isLong && price >= pos.stop) exit = { kind: '止损', pnl: pos.entry - price };
+  const held = nowSec - pos.entryTime;
+  if (!exit && held >= V2_POSITION_HOLD_SEC) {
+    exit = { kind: '到期', pnl: isLong ? price - pos.entry : pos.entry - price };
+  }
+  if (!exit) return false;
+
+  const pnl = Math.round(exit.pnl);
+  const pnlPct = ((exit.pnl / pos.entry) * 100).toFixed(2);
+  const title = `${pnl >= 0 ? '✅' : '⚠️'} ${pos.dir} 离场（${exit.kind}）`;
+  const body = [
+    `入场: $${Math.round(pos.entry).toLocaleString('en-US')}`,
+    `离场: $${Math.round(price).toLocaleString('en-US')}`,
+    `盈亏: ${pnl >= 0 ? '+' : ''}${pnl} 点 (${pnlPct}%)`,
+    `持仓: ${(held / 3600).toFixed(1)} 小时`,
+    `策略: 趋势跟随V2`,
+  ].join('\n');
+  if (!PAUSE_PUSH) await sendBark(title, body, 'passive', 'BTC-持仓管理');
+  state.open_pos = null; // 离场后允许下一笔开仓
+  return true;
 }
 
 // ============================================================
@@ -1040,6 +1117,9 @@ async function fetchAndAnalyze(env) {
   const now = Date.now();
   const nowSec = now / 1000;
 
+  // plan A ①③：先处理已有持仓的止损 / 移动止损 / 到期离场（每周期必跑，与记录/推送解耦）
+  await managePosition(env, state, newPrice, nowSec);
+
   // ---- A/B 样本记录：两个策略各自独立记录，用实盘表现对比 ----
   // 间隔 30 分钟而非 5 分钟：相邻信号高度重叠不构成独立样本，
   // 拉长间隔可提升统计显著性，同时避免 KV 记录数暴涨
@@ -1059,7 +1139,9 @@ async function fetchAndAnalyze(env) {
   }
 
   // ---- 推送：只用 ACTIVE_STRATEGY 指定的那个 ----
-  if (signal.direction !== 'WAIT' && signal.probability >= PUSH_MIN_PROB) {
+  // 非重叠持仓（plan A ①）：已有持仓时不再开新仓，直到 managePosition 离场清空。
+  // 这是「一波行情只开一次仓、持满 24H」的实盘实现，对应回测口径 B 盈亏比 1.06→2.73。
+  if (signal.direction !== 'WAIT' && signal.probability >= PUSH_MIN_PROB && !state.open_pos) {
     if (!state.history) state.history = [];
     const lastHist = state.history[state.history.length - 1];
     if (!lastHist || lastHist.direction !== signal.direction || (nowSec - lastHist.time) > 300) {
@@ -1089,6 +1171,14 @@ async function fetchAndAnalyze(env) {
         const tag = isBigMove ? '🚨 重大行情' : '🔔 常规信号';
         const title = `${emoji} ${dirCN}`;
         const horizon = signal.targetHorizon || 1;
+
+        // plan A ③：按 ATR 计算初始止损位，写进推送体并登记持仓
+        const isLong = signal.direction === 'LONG';
+        const stopPct = Math.min(V2_STOP_MAX_PCT,
+          Math.max(V2_STOP_MIN_PCT, (signal.atrPct || 0.3) * V2_STOP_MULT));
+        const stopPrice = isLong ? newPrice * (1 - stopPct / 100)
+                                 : newPrice * (1 + stopPct / 100);
+
         const body = [
           `${tag}`,
           `价格: $${newPrice.toLocaleString('en-US')}`,
@@ -1097,6 +1187,7 @@ async function fetchAndAnalyze(env) {
           `置信度: ${(signal.confidence * 100).toFixed(0)}%`,
           signal.rsi !== undefined ? `RSI: ${signal.rsi}` : null,
           signal.atrPct ? `波动率: ${signal.atrPct}%` : null,
+          `建议止损: $${Math.round(stopPrice).toLocaleString('en-US')} (-${stopPct.toFixed(1)}%)`,
           `策略: ${ACTIVE_STRATEGY === 'v2' ? '趋势跟随V2' : '均值回归V1'}`,
         ].filter(Boolean).join('\n');
         // critical = 突破静音/专注模式；passive = 静默通知
@@ -1106,6 +1197,15 @@ async function fetchAndAnalyze(env) {
         await sendBark(title, body, urgency, group);
         state.last_signal_time = nowSec;
         state.last_signal_dir = signal.direction;
+        // 登记持仓：非重叠 + 移动止损的生命周期从这里开始
+        state.open_pos = {
+          dir: signal.direction,
+          entry: newPrice,
+          entryTime: nowSec,
+          stop: stopPrice,
+          stopPct,
+          best: newPrice,
+        };
       }
     }
   }

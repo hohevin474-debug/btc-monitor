@@ -423,8 +423,18 @@ function strategyV2(candles, p = {}) {
     score *= (p.volBoost ?? 1.15);   // 放量增强信号
   }
 
-  const thr = p.threshold ?? 0.25;
-  const dir = score > thr ? 'LONG' : score < -thr ? 'SHORT' : 'WAIT';
+  // 非对称阈值（与 worker.js V2 对齐）：做多更严
+  const thrLong = p.thresholdLong ?? p.threshold ?? 0.25;
+  const thrShort = p.thresholdShort ?? p.threshold ?? 0.25;
+  let dir = score > thrLong ? 'LONG' : score < -thrShort ? 'SHORT' : 'WAIT';
+
+  // 趋势对齐过滤（与 worker.js V2 对齐）：方向须与均线趋势一致
+  if (p.requireTrendAlign && dir !== 'WAIT') {
+    const upTrend = maFast > maSlow;
+    const downTrend = maFast < maSlow;
+    if (!((dir === 'LONG' && upTrend) || (dir === 'SHORT' && downTrend))) dir = 'WAIT';
+  }
+
   return { dir, strength: Math.abs(score), score };
 }
 
