@@ -1,0 +1,38 @@
+name: Temp Recent 2D
+on:
+  workflow_dispatch:
+jobs:
+  calc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch & Analyze
+        run: |
+          curl -sS -L --max-time 90 -H 'User-Agent: Mozilla/5.0' -o /tmp/bt.json "https://btc-monitor.hohevin474.workers.dev/api/backtest?limit=500"
+          node <<'NODE'
+          const fs=require('fs');
+          const raw=JSON.parse(fs.readFileSync('/tmp/bt.json','utf8'));
+          const recs=raw.recent||[];
+          if(!recs.length){console.log('NO DATA');process.exit(0);}
+          const now=Math.max(...recs.map(r=>r.time));
+          const cutoff=now-2*86400;
+          const r2=recs.filter(r=>r.time>=cutoff);
+          const fmt=t=>new Date(t*1000).toISOString().replace('T',' ').slice(0,16)+'Z';
+          let lines=['=== 最近两天战绩 (now='+fmt(now)+', cutoff='+fmt(cutoff)+') ==='];
+          lines.push('记录总数(全量): '+recs.length+'  最近两天: '+r2.length);
+          let total=0,win=0,longN=0,longPnl=0,shortN=0,shortPnl=0,h6total=0,doneN=0;
+          r2.forEach(r=>{
+            const p=r.pnl_h24; const p6=r.pnl_h6;
+            if(p!=null){doneN++; total+=p; if(p>0)win++; if(r.direction==='LONG'){longN++;longPnl+=p;}else if(r.direction==='SHORT'){shortN++;shortPnl+=p;}}
+            if(p6!=null)h6total+=p6;
+            lines.push('['+fmt(r.time)+'] '+r.direction+' @'+r.price+' prob='+(r.prob!=null?(r.prob*100).toFixed(0)+'%':'?')+' h24='+(r.h24!=null?r.h24:'NA')+' pnl24='+(p==null?'pending':p)+' mfe24='+(r.mfe24==null?'?':r.mfe24)+' mae24='+(r.mae24==null?'?':r.mae24)+' done='+r.done);
+          });
+          lines.push('--- 24H汇总(已到期) ---');
+          lines.push('笔数: '+doneN+'  总盈亏: '+total+'  胜率: '+(doneN?(100*win/doneN).toFixed(0)+'%':'NA'));
+          lines.push('LONG: n='+longN+' pnl='+longPnl+'   SHORT: n='+shortN+' pnl='+shortPnl);
+          lines.push('6H汇总盈亏: '+h6total);
+          lines.push('--- 全量 accuracy ---');
+          lines.push(JSON.stringify(raw.accuracy||{}));
+          lines.push('--- pnl(全量dedupe) ---');
+          lines.push(JSON.stringify(raw.pnl||{}));
+          console.log(lines.join('\n'));
+          NODE
