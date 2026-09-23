@@ -8,51 +8,45 @@ jobs:
       - name: Fetch & Analyze
         run: |
           curl -sS -L --max-time 90 -H 'User-Agent: Mozilla/5.0' -o /tmp/bt.json "https://btc-monitor.hohevin474.workers.dev/api/backtest?limit=500"
-          curl -sS -L --max-time 90 -H 'User-Agent: Mozilla/5.0' -o /tmp/state.json "https://btc-monitor.hohevin474.workers.dev/api/state"
           node <<'NODE'
           const fs=require('fs');
           const bt=JSON.parse(fs.readFileSync('/tmp/bt.json','utf8'));
-          let st={};
-          try{ st=JSON.parse(fs.readFileSync('/tmp/state.json','utf8')); }catch(e){ st={_err:e.message}; }
           const recs=bt.recent||[];
-          // 去重（同方向间隔<6h 合并，只保留段首条）——与战绩报告同一口径
+          const v2=recs.filter(r=>(r.strategy||'v1')==='v2');
           function dedupe(rs,gap=6*3600){const s=[...rs].sort((a,b)=>a.time-b.time);const o=[];for(const r of s){const l=o[o.length-1];if(l&&l.direction===r.direction&&(r.time-l.time)<gap)continue;o.push(r);}return o;}
-          const seg=dedupe(recs);
+          const seg=dedupe(v2);
           function summarize(list,h){
             const done=list.filter(r=>r['pnl_'+h]!=null);
             let total=0,win=0,longN=0,longP=0,shortN=0,shortP=0;
             done.forEach(r=>{const p=r['pnl_'+h];total+=p;if(p>0)win++;if(r.direction==='LONG'){longN++;longP+=p;}else{shortN++;shortP+=p;}});
-            return {n:done.length,total,winRate:done.length?Math.round(100*win/done.length):null,
-                    longN,longP,shortN,shortP,
-                    pf: done.length? +(total/Math.abs(done.reduce((a,r)=>a+(r['pnl_'+h]<0?-r['pnl_'+h]:0),0)||1)).toFixed(2):null};
+            return {n:done.length,total,winRate:done.length?Math.round(100*win/done.length):null,longN,longP,shortN,shortP};
           }
           const now=Math.max(...recs.map(r=>r.time));
           const cutoff=now-2*86400;
-          const seg2=seg.filter(r=>r.time>=cutoff);
-          const all=summarize(seg,'h24');
-          const all6=summarize(seg,'h6');
-          const last2=summarize(seg2,'h24');
-          const last26=summarize(seg2,'h6');
+          const A_DEPLOY=Date.parse('2026-09-20T03:19:42Z')/1000; // 方案A 部署时间戳(UTC)
+          const before=seg.filter(r=>r.time<A_DEPLOY);
+          const after=seg.filter(r=>r.time>=A_DEPLOY);
+          const last2=seg.filter(r=>r.time>=cutoff);
           const fmt=t=>new Date(t*1000).toISOString().replace('T',' ').slice(0,16)+'Z';
           let L=[];
-          L.push('now='+fmt(now)+'  cutoff='+fmt(cutoff));
+          L.push('now='+fmt(now)+'  cutoff='+fmt(cutoff)+'  方案A部署='+fmt(A_DEPLOY));
           L.push('');
-          L.push('=== 全量(去重后段数='+seg.length+') ===');
-          L.push('24H: '+JSON.stringify(all));
-          L.push('6H : '+JSON.stringify(all6));
+          L.push('=== 方案A之前 V2(去重段数='+before.length+') ===');
+          L.push('24H: '+JSON.stringify(summarize(before,'h24')));
           L.push('');
-          L.push('=== 最近两天(去重段数='+seg2.length+') ===');
-          L.push('24H: '+JSON.stringify(last2));
-          L.push('6H : '+JSON.stringify(last26));
+          L.push('=== 方案A之后 V2(去重段数='+after.length+') ===');
+          L.push('24H: '+JSON.stringify(summarize(after,'h24')));
+          L.push('6H : '+JSON.stringify(summarize(after,'h6')));
           L.push('');
-          L.push('--- 最近两天逐笔(去重) ---');
-          seg2.forEach(r=>{
+          L.push('=== 最近两天 V2(去重段数='+last2.length+') ===');
+          L.push('24H: '+JSON.stringify(summarize(last2,'h24')));
+          L.push('6H : '+JSON.stringify(summarize(last2,'h6')));
+          L.push('');
+          L.push('--- 最近两天 V2 逐笔(去重) ---');
+          last2.forEach(r=>{
+            const p=r.pnl_h24;
             L.push('['+fmt(r.time)+'] '+r.direction+' @'+r.price+' prob='+(r.prob!=null?(r.prob*100).toFixed(0)+'%':'?')
-              +' pnl24='+(r.pnl_h24==null?'pending':r.pnl_h24)+' mfe24='+(r.mfe24==null?'?':r.mfe24)+' mae24='+(r.mae24==null?'?':r.mae24)+' done='+r.done);
+              +' pnl24='+(p==null?'pending':p)+' mfe24='+(r.mfe24==null?'?':r.mfe24)+' mae24='+(r.mae24==null?'?':r.mae24)+' done='+r.done);
           });
-          L.push('');
-          L.push('=== /api/state 关键配置 ===');
-          L.push('active_strategy='+st.active_strategy);
-          L.push('signal_v2='+JSON.stringify(st.signal_v2||st.signal||{}).slice(0,400));
           console.log(L.join('\n'));
           NODE
