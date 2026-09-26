@@ -358,11 +358,37 @@ function strategyV2(candles, p = {}) {
   if (closes.length < 60) return { dir: 'WAIT', strength: 0, score: 0 };
 
   const price = closes[closes.length - 1];
+
+  // 优化项默认值（与 worker.js V2 对齐）
+  const regimeQuietPctile = p.regimeQuietPctile ?? 0.2;
+  const volAdapt = p.volAdapt ?? true;
+  const volAdaptLo = p.volAdaptLo ?? 0.85;
+  const volAdaptHi = p.volAdaptHi ?? 1.35;
+  const atrWindow = p.atrWindow ?? 168;
+  const multicycle = p.multicycle ?? false;
+  const longMA = p.longMA ?? 160;
+
   const atr = calcATR(candles, p.atrPeriod || 14);
   const atrPct = atr / price * 100;
 
   // 波动率门槛：太安静的市不参与（500 点目标不现实）
   if (atrPct < (p.minAtrPct ?? 0.25)) return { dir: 'WAIT', strength: 0, score: 0 };
+
+  // ATR 百分位（regime + 自适应阈值用）
+  let atrPctile = 0.5;
+  if (candles.length >= atrWindow + 14) {
+    const series = [];
+    for (let i = candles.length - atrWindow; i < candles.length; i++) {
+      const a = calcATR(candles.slice(0, i + 1), p.atrPeriod || 14);
+      if (a > 0) series.push((a / candles[i].c) * 100);
+    }
+    if (series.length) {
+      const below = series.filter(x => x < atrPct).length;
+      atrPctile = below / series.length;
+    }
+  }
+  // Regime 过滤：ATR 分位极低 = 极度安静无趋势，不参与
+  if (regimeQuietPctile && atrPctile < regimeQuietPctile) return { dir: 'WAIT', strength: 0, score: 0 };
 
   // 趋势强度门槛（ADX）：默认关闭，需显式传 minAdx 才启用。
   // 与 worker.js 的 calcADX 保持一致，否则离线校准会和实盘对不上。
@@ -424,8 +450,10 @@ function strategyV2(candles, p = {}) {
   }
 
   // 非对称阈值（与 worker.js V2 对齐）：做多更严
-  const thrLong = p.thresholdLong ?? p.threshold ?? 0.25;
-  const thrShort = p.thresholdShort ?? p.threshold ?? 0.25;
+  let volAdj = 1;
+  if (volAdapt) volAdj = Math.min(volAdaptHi, Math.max(volAdaptLo, 0.85 + atrPctile));
+  const thrLong = (p.thresholdLong ?? p.threshold ?? 0.25) * volAdj;
+  const thrShort = (p.thresholdShort ?? p.threshold ?? 0.25) * volAdj;
   let dir = score > thrLong ? 'LONG' : score < -thrShort ? 'SHORT' : 'WAIT';
 
   // 趋势对齐过滤（与 worker.js V2 对齐）：方向须与均线趋势一致
@@ -435,7 +463,14 @@ function strategyV2(candles, p = {}) {
     if (!((dir === 'LONG' && upTrend) || (dir === 'SHORT' && downTrend))) dir = 'WAIT';
   }
 
-  return { dir, strength: Math.abs(score), score };
+  // 多周期确认（与 worker.js V2 对齐，默认关）：长周期均线趋势须与信号一致
+  if (multicycle && dir !== 'WAIT') {
+    const longM = sma(closes, longMA);
+    const longUp = price > longM;
+    if (!((dir === 'LONG' && longUp) || (dir === 'SHORT' && !longUp))) dir = 'WAIT';
+  }
+
+  return { dir, strength: Math.abs(score), score, atrPct };
 }
 
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -486,32 +521,38 @@ function runBacktest(candles, strategyName, params = {}, opts = {}) {
     lastSignalIdx = i;
 
     const entry = candles[i].c;
-    const rec = { idx: i, t: candles[i].t, dir: sig.dir, entry, strength: sig.strength };
+    const isLong = sig.dir === 'LONG';
+    const rec = { idx: i, t: candles[i].t, dir: sig.dir, entry, strength: sig.strength, atrPct: sig.atrPct };
+    // 止损模拟（与线上一致）：固定 stopPct = clamp(1.5×ATR%, 1.2%, 3.0%)
+    const stopPct = sig.atrPct ? Math.min(3.0, Math.max(1.2, sig.atrPct * 1.5)) : null;
+    const stop = stopPct ? (isLong ? entry * (1 - stopPct / 100) : entry * (1 + stopPct / 100)) : null;
+    let stopTriggered = false, stopK = Infinity;
 
-    for (const h of horizons) {
-      const fwd = candles[i + h];
-      if (!fwd) continue;
-      const diff = fwd.c - entry;
-      rec[`p_${h}`] = diff;                       // 点数变化（带符号）
-      rec[`hit_${h}`] = Math.abs(diff) >= target;
-      rec[`ok_${h}`] = sig.dir === 'LONG' ? diff > 0 : diff < 0;
-    }
-
-    // 最大有利波动 MFE / 最大不利波动 MAE（取最大窗口内）
+    // MFE/MAE + 止损检测（取最大窗口内）
     let mfe = 0, mae = 0;
     for (let k = 1; k <= maxFwd && i + k < candles.length; k++) {
       const hi = candles[i + k].h - entry;
       const lo = candles[i + k].l - entry;
-      if (sig.dir === 'LONG') {
-        mfe = Math.max(mfe, hi);
-        mae = Math.min(mae, lo);
-      } else {
-        mfe = Math.max(mfe, -lo);
-        mae = Math.min(mae, -hi);
+      if (isLong) { mfe = Math.max(mfe, hi); mae = Math.min(mae, lo); }
+      else { mfe = Math.max(mfe, -lo); mae = Math.min(mae, -hi); }
+      if (stop && !stopTriggered) {
+        const hit = isLong ? candles[i + k].l <= stop : candles[i + k].h >= stop;
+        if (hit) { stopTriggered = true; stopK = k; }
       }
     }
-    rec.mfe = mfe;
-    rec.mae = mae;
+    rec.mfe = mfe; rec.mae = mae;
+    if (stopTriggered) { rec.stopped = true; rec.stopK = stopK; }
+
+    // 逐窗口盈亏：若止损先触发则用止损盈亏，否则用终点价盈亏（P0-1 战绩计入止损）
+    for (const h of horizons) {
+      const fwd = candles[i + h];
+      if (!fwd) continue;
+      const diff = fwd.c - entry;                       // 终点盈亏
+      const pnl = (stopTriggered && stopK <= h) ? (isLong ? stop - entry : entry - stop) : diff;
+      rec[`p_${h}`] = Math.round(pnl);
+      rec[`hit_${h}`] = Math.abs(pnl) >= target;
+      rec[`ok_${h}`] = isLong ? pnl > 0 : pnl < 0;
+    }
     trades.push(rec);
   }
 

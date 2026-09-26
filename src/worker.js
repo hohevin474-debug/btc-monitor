@@ -30,6 +30,11 @@ const V2_POSITION_HOLD_SEC = 24 * 3600;
 const V2_STOP_MULT = 1.5;
 const V2_STOP_MIN_PCT = 1.2;
 const V2_STOP_MAX_PCT = 3.0;
+// 移动止损激活门槛（plan P1-3）：盈利达该倍数 ATR 后才启动追踪止损，
+// 此前保持初始止损位，避免刚开仓就被噪音扫损。
+const V2_TRAIL_ACTIVATE_ATR = 1.0;
+// 多周期确认所用的"长周期"均线（单位=1H根数）。300根1H≈12.5天，160根≈6.7天≈近似日线趋势。
+const V2_LONG_MA = 160;
 
 // 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（新）
 // 两者始终并行计算并同时记录回测样本，此开关只决定推送哪一个。
@@ -427,6 +432,18 @@ const V2 = {
   //   高 ADX 的震荡，波动大但方向反复，ADX 区分不了。它改善的是长期统计。
   minAdx: 25,
   adxPeriod: 14,
+  // —— 优化项（plan 全执行，开关化）——
+  // Regime 过滤：当前 ATR 占近 atrWindow 根分位低于此 → 极度安静，趋势跟随不参与
+  regimeQuietPctile: 0.2,
+  // 波动率自适应阈值：高波动时自动加严(volAdaptHi)，低波动放松(volAdaptLo)
+  volAdapt: true,
+  volAdaptLo: 0.85, volAdaptHi: 1.35,
+  atrWindow: 168,
+  // 多周期确认（默认关，待样本验证）：要求信号方向与长周期均线趋势一致
+  multicycle: false,
+  longMA: 160,
+  // V1/V2 共振（默认关，待样本验证）：两策略同向才交易，进一步降频
+  resonance: false,
   // 概率模型的归一化基准，与信号阈值解耦。
   // 若直接用 threshold 归一化：任何通过门槛的信号都有 |score| >= threshold，
   // 于是 min(1, |score|/threshold) 恒等于 1，趋势项不再提供任何区分度，
@@ -505,6 +522,22 @@ function analyzeV2(klines, price) {
   const atr = calcATR(klines, 14);
   const atrPct = (atr / price) * 100;
 
+  // ATR 百分位（regime 过滤 + 自适应阈值用）：当前 atrPct 在近 atrWindow 根里的分位。
+  // 0.5 = 中位，<0.2 = 处于历史极低波动（无趋势），>0.8 = 高波动需更严。
+  let atrPctile = 0.5;
+  if (klines.length >= (V2.atrWindow || 168) + 14) {
+    const series = [];
+    const w = V2.atrWindow || 168;
+    for (let i = klines.length - w; i < klines.length; i++) {
+      const a = calcATR(klines.slice(0, i + 1), 14);
+      if (a > 0) series.push((a / klines[i].c) * 100);
+    }
+    if (series.length) {
+      const below = series.filter(x => x < atrPct).length;
+      atrPctile = below / series.length;
+    }
+  }
+
   // 波动率门槛：市场太安静时 500 点目标不现实，直接不发信号
   if (atrPct < V2.minAtrPct) {
     return { ...blank(`😴 波动率不足 (ATR ${atrPct.toFixed(2)}% < ${V2.minAtrPct}%)，不满足500点条件`, {
@@ -523,6 +556,17 @@ function analyzeV2(klines, price) {
     return { ...blank(`📊 趋势强度不足 (ADX ${adx.toFixed(0)} < ${V2.minAdx})，震荡市不参与`, {
         atr:   { v: +atrPct.toFixed(3), need: V2.minAtrPct, pass: true },
         trend: { v: adxNum, need: V2.minAdx, pass: false },
+        score: { v: 0, need: V2.threshold, pass: false },
+        prob:  { v: 0, need: PUSH_MIN_PROB, pass: false },
+      }),
+      atr, atrPct, adx: adxNum };
+  }
+
+  // Regime 过滤（plan P1-1）：ATR 分位极低 = 市场极度安静、无方向，趋势跟随不参与
+  if (V2.regimeQuietPctile && atrPctile < V2.regimeQuietPctile) {
+    return { ...blank(`😴 波动率处于历史低位 (ATR分位 ${(atrPctile * 100).toFixed(0)}% < ${(V2.regimeQuietPctile * 100).toFixed(0)}%)，无趋势不参与`, {
+        atr:   { v: +atrPct.toFixed(3), need: V2.minAtrPct, pass: atrPct >= V2.minAtrPct },
+        trend: { v: adxNum, need: V2.minAdx, pass: adxNum !== null && adxNum >= V2.minAdx },
         score: { v: 0, need: V2.threshold, pass: false },
         prob:  { v: 0, need: PUSH_MIN_PROB, pass: false },
       }),
@@ -574,8 +618,13 @@ function analyzeV2(klines, price) {
   }
 
   let direction = 'WAIT';
-  const thrLong = V2.thresholdLong ?? V2.threshold;
-  const thrShort = V2.thresholdShort ?? V2.threshold;
+  // 波动率自适应阈值（plan P1-5）：高波动时加严、低波动时放松
+  let volAdj = 1;
+  if (V2.volAdapt) {
+    volAdj = Math.min(V2.volAdaptHi, Math.max(V2.volAdaptLo, 0.85 + atrPctile));
+  }
+  const thrLong = (V2.thresholdLong ?? V2.threshold) * volAdj;
+  const thrShort = (V2.thresholdShort ?? V2.threshold) * volAdj;
   if (score > thrLong) direction = 'LONG';
   else if (score < -thrShort) direction = 'SHORT';
 
@@ -587,6 +636,17 @@ function analyzeV2(klines, price) {
     if (!aligned) {
       direction = 'WAIT';
       reasons.push('⛔ 趋势未对齐，不逆势开仓');
+    }
+  }
+
+  // 多周期确认（plan P1-2，默认关）：长周期均线趋势须与信号方向一致，
+  // 用 1H 内长 MA(≈160根) 近似日线趋势，零额外外部调用。
+  if (V2.multicycle && direction !== 'WAIT') {
+    const longMA = sma(closes, V2.longMA);
+    const longTrendUp = price > longMA;
+    if (!((direction === 'LONG' && longTrendUp) || (direction === 'SHORT' && !longTrendUp))) {
+      direction = 'WAIT';
+      reasons.push('⛔ 长周期趋势未确认，不交易');
     }
   }
 
@@ -665,11 +725,19 @@ async function managePosition(env, state, price, nowSec) {
   if (!pos) return false;
 
   const isLong = pos.dir === 'LONG';
-  // 移动止损：跟踪极值，有利方向移动后上移止损，只收紧不放松
-  pos.best = isLong ? Math.max(pos.best, price) : Math.min(pos.best, price);
-  const sp = pos.stopPct;
-  pos.stop = isLong ? Math.max(pos.stop, pos.best * (1 - sp / 100))
-                    : Math.min(pos.stop, pos.best * (1 + sp / 100));
+  // 移动止损激活门槛（plan P1-3）：盈利达 1×ATR 后才启动追踪止损，
+  // 此前保持开仓时算好的初始止损位，避免刚开仓就被噪音扫损。
+  const atr = pos.atrPct ? pos.entry * (pos.atrPct / 100) : 0;
+  if (!pos.trailingActive) {
+    const activated = isLong ? price >= pos.entry + atr : price <= pos.entry - atr;
+    if (activated) pos.trailingActive = true;
+  }
+  // 仅激活后：跟踪极值并上移止损，只收紧不放松
+  if (pos.trailingActive) {
+    pos.best = isLong ? Math.max(pos.best, price) : Math.min(pos.best, price);
+    pos.stop = isLong ? Math.max(pos.stop, pos.best * (1 - pos.stopPct / 100))
+                      : Math.min(pos.stop, pos.best * (1 + pos.stopPct / 100));
+  }
 
   let exit = null;
   if (isLong && price <= pos.stop) exit = { kind: '止损', pnl: price - pos.entry };
@@ -769,7 +837,7 @@ async function saveBacktest(env, records) {
 
 // 新增一条待验证信号
 // 除终点价格外，同步记录窗口内的最高/最低价，用于计算 MFE/MAE
-async function recordSignal(env, signal, price, nowMs, strategy = 'v1') {
+async function recordSignal(env, signal, price, nowMs, strategy = 'v1', stopPct = null) {
   const records = await getBacktest(env);
   records.push({
     id: nowMs,
@@ -779,6 +847,7 @@ async function recordSignal(env, signal, price, nowMs, strategy = 'v1') {
     price: price,
     probability: signal.probability,
     predicted_move: signal.predicted_move,
+    stopPct,                       // 开仓时 ATR 止损幅度(%)：战绩计入止损用
     // 终点价格
     h1: null, h6: null, h24: null,
     // 窗口内极值（用于算 MFE/MAE，衡量真实可捕捉的盈利空间）
@@ -818,6 +887,22 @@ async function backfillBacktest(env, price, nowMs) {
     if (age <= H24) {
       if (price > (r.h24_hi ?? -Infinity)) { r.h24_hi = price; changed = true; }
       if (price < (r.h24_lo ?? Infinity)) { r.h24_lo = price; changed = true; }
+    }
+
+    // 止损提前结账（plan P0-1）：带 stopPct 的记录，窗口内价格触及止损价即结算，
+    // 盈亏按止损位而非 24H 终点价计算 —— 让战绩真实反映风控效果。
+    if (r.stopPct && r.h24 === null && !r.done) {
+      const isLong = r.direction === 'LONG';
+      const stop = isLong ? r.price * (1 - r.stopPct / 100)
+                          : r.price * (1 + r.stopPct / 100);
+      const hit = isLong ? (r.h24_lo ?? Infinity) <= stop
+                         : (r.h24_hi ?? -Infinity) >= stop;
+      if (hit) {
+        r.h24 = Math.round(stop);
+        r.stopped = true;
+        r.done = true;
+        changed = true;
+      }
     }
 
     // 窗口关闭 → 锁定终点价格
@@ -1135,13 +1220,19 @@ async function fetchAndAnalyze(env) {
     if (nowSec - (state[lastKey] || 0) < interval) continue;
     state[lastKey] = nowSec;
     state[lastDirKey] = sig.direction;
-    await recordSignal(env, sig, newPrice, now, tag);
+    // 仅 V2 记录止损幅度（V1 不交易，止损无意义）
+    const stopPct = (tag === 'v2' && sig.atrPct)
+      ? Math.min(V2_STOP_MAX_PCT, Math.max(V2_STOP_MIN_PCT, sig.atrPct * V2_STOP_MULT))
+      : null;
+    await recordSignal(env, sig, newPrice, now, tag, stopPct);
   }
 
   // ---- 推送：只用 ACTIVE_STRATEGY 指定的那个 ----
   // 非重叠持仓（plan A ①）：已有持仓时不再开新仓，直到 managePosition 离场清空。
   // 这是「一波行情只开一次仓、持满 24H」的实盘实现，对应回测口径 B 盈亏比 1.06→2.73。
-  if (signal.direction !== 'WAIT' && signal.probability >= PUSH_MIN_PROB && !state.open_pos) {
+  // 共振过滤（plan P1-4，默认关）：要求 V1/V2 同向才交易，进一步降频
+  const resonate = !V2.resonance || (signalV1.direction === signal.direction);
+  if (signal.direction !== 'WAIT' && signal.probability >= PUSH_MIN_PROB && !state.open_pos && resonate) {
     if (!state.history) state.history = [];
     const lastHist = state.history[state.history.length - 1];
     if (!lastHist || lastHist.direction !== signal.direction || (nowSec - lastHist.time) > 300) {
@@ -1204,6 +1295,8 @@ async function fetchAndAnalyze(env) {
           entryTime: nowSec,
           stop: stopPrice,
           stopPct,
+          atrPct: signal.atrPct || 0.3,
+          trailingActive: false,
           best: newPrice,
         };
       }

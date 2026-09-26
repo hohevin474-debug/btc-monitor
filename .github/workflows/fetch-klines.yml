@@ -3,6 +3,11 @@ name: Fetch OKX Klines
 # 沙箱环境的 DNS 把交易所域名黑洞掉了（alidns 对 www.okx.com 返回 169.254.0.2），
 # 但 Actions runner 在美国机房，网络不受限。
 # 这里把「抓历史 K 线」这件事搬到云端做，产物用 artifact 带回本地跑回测。
+#
+# 触发方式：
+#   1. workflow_dispatch（手动，可指定 bar/total）
+#   2. schedule（每月 1 号 UTC 0 点自动跑）—— 自动化校准闭环：
+#      fetch 最新 K 线 → 跑回测 + walk-forward 生成报告 → 上传 artifact
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +19,8 @@ on:
         description: '抓取根数'
         required: false
         default: '3000'
+  schedule:
+    - cron: '0 0 1 * *'   # 每月 1 号 UTC 00:00 自动校准
 
 jobs:
   fetch:
@@ -28,11 +35,27 @@ jobs:
           node-version: '20'
 
       - name: Fetch klines
-        run: node scripts/fetch-klines.mjs ${{ github.event.inputs.bar }} ${{ github.event.inputs.total }} klines.json
+        run: node scripts/fetch-klines.mjs ${{ github.event.inputs.bar || '1H' }} ${{ github.event.inputs.total || '3000' }} klines.json
 
-      - name: Upload artifact
+      - name: Upload klines artifact
         uses: actions/upload-artifact@v4
         with:
-          name: klines-${{ github.event.inputs.bar }}
+          name: klines-${{ github.event.inputs.bar || '1H' }}
           path: klines.json
-          retention-days: 7
+          retention-days: 30
+
+      # 自动化校准：用最新数据跑回测 + walk-forward，报告带回归档
+      - name: 回测 + Walk-forward 稳健性检验
+        run: |
+          npm install --no-save 2>/dev/null || true
+          echo "=== 回测基线 ===" && node scripts/backtest.mjs || true
+          echo "=== Walk-forward ===" && node scripts/walkforward.mjs klines.json 600 400 || true
+
+      - name: Upload backtest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-report
+          path: |
+            backtest_report.json
+          retention-days: 30
