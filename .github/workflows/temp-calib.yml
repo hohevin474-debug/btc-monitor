@@ -1,0 +1,18 @@
+name: temp-calib
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/calib.mjs'
+      - 'scripts/backtest.mjs'
+      - 'data/**'
+jobs:
+  calib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 抓取OKX补全数据 + walk-forward + 实盘窗口网格扫描
+        run: node scripts/calib.mjs

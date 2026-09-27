@@ -523,8 +523,11 @@ function runBacktest(candles, strategyName, params = {}, opts = {}) {
     const entry = candles[i].c;
     const isLong = sig.dir === 'LONG';
     const rec = { idx: i, t: candles[i].t, dir: sig.dir, entry, strength: sig.strength, atrPct: sig.atrPct };
-    // 止损模拟（与线上一致）：固定 stopPct = clamp(1.5×ATR%, 1.2%, 3.0%)
-    const stopPct = sig.atrPct ? Math.min(3.0, Math.max(1.2, sig.atrPct * 1.5)) : null;
+    // 止损模拟（与线上一致）：stopPct = clamp(stopMult×ATR%, stopMin, stopMax)，默认 1.5/1.2/3.0
+    const stopMult = params.stopMult ?? 1.5;
+    const stopMin = params.stopMin ?? 1.2;
+    const stopMax = params.stopMax ?? 3.0;
+    const stopPct = sig.atrPct ? Math.min(stopMax, Math.max(stopMin, sig.atrPct * stopMult)) : null;
     const stop = stopPct ? (isLong ? entry * (1 - stopPct / 100) : entry * (1 + stopPct / 100)) : null;
     let stopTriggered = false, stopK = Infinity;
 
