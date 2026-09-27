@@ -27,7 +27,7 @@ const BIG_MOVE_POINTS = 500;
 const V2_POSITION_HOLD_SEC = 24 * 3600;
 // 止损距离 = ATR% × 倍数，再夹在 [下限, 上限] 之间（占价百分比）。
 // 动机：实盘 MAE(最大不利波动) 1315 ≫ MFE 871，亏时扛太久。止损把单笔最大亏损截断。
-const V2_STOP_MULT = 1.5;
+const V2_STOP_MULT = 2.0;
 const V2_STOP_MIN_PCT = 1.2;
 const V2_STOP_MAX_PCT = 3.0;
 // 移动止损激活门槛（plan P1-3）：盈利达该倍数 ATR 后才启动追踪止损，
@@ -408,13 +408,13 @@ const V2 = {
   //   0.50 全量期望最高（+130）却有 2 段为负；0.45 期望 +98 但只有 1 段为负。
   //   跟「趋势突破 +1141」是同一个坑：追全量峰值 = 过拟合。改取 0.45。
   //   另注：准确率几乎不随阈值变化（49.1%~49.5%），变的是赔率结构。
-  threshold: 0.45,          // 做空基线阈值（SHORT 用，同时作为面板显示基线）
+  threshold: 0.50,          // 对称基线阈值（判定用 thresholdLong/Short）
   // 非对称阈值（plan A ②，2026-09-18 上线）：做多更严。
   // 实盘 29 笔做多亏了 88%（逆势做多主因）。回测（非重叠 + ADX≥25）：
   //   LONG 0.45/SHORT 0.45 → LONG 均值 +627
   //   LONG 0.60/SHORT 0.45 → LONG 均值 +1072，整体 +828，盈亏比 4.03
   thresholdLong: 0.60,      // 做多门槛提高，过滤弱做多信号
-  thresholdShort: 0.45,     // 做空门槛
+  thresholdShort: 0.55,     // 做空门槛提高（校准：更严过滤逆风段做空）
   // 趋势对齐过滤（plan A ③）：只在均线趋势方向一致时开仓，杜绝逆势做多。
   // 做多需 maFast>maSlow（多头排列），做空需 maFast<maSlow（空头排列）。
   requireTrendAlign: true,
@@ -430,7 +430,7 @@ const V2 = {
   //   选 25 不是网格搜索挑出来的 —— 它是 Wilder 原书的标准分界，有先验依据。
   //   ⚠️ 诚实提醒：ADX 救不了最近这段（该段期望 +126 → −984）。当前市场是
   //   高 ADX 的震荡，波动大但方向反复，ADX 区分不了。它改善的是长期统计。
-  minAdx: 25,
+  minAdx: 20,
   adxPeriod: 14,
   // —— 优化项（plan 全执行，开关化）——
   // Regime 过滤：当前 ATR 占近 atrWindow 根分位低于此 → 极度安静，趋势跟随不参与

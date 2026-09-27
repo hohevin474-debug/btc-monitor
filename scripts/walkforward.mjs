@@ -20,8 +20,8 @@ const N = data.length;
 const params = {
   minAtrPct: 0.15, momPeriod: 24, momScale: 2, fastMA: 10, slowMA: 40, trendScale: 0.5,
   wMom: 0.35, wTrend: 0.2, wRsi: 0.1, wBreak: 0.25, volRatio: 1.1, volBoost: 1.15,
-  threshold: 0.45, thresholdLong: 0.60, thresholdShort: 0.45, requireTrendAlign: true,
-  minAdx: 25, adxPeriod: 14, driftRef: 0.75, driftStrength: 0.3, atrToSigma: 1.3,
+  threshold: 0.50, thresholdLong: 0.60, thresholdShort: 0.55, requireTrendAlign: true,
+  minAdx: 20, adxPeriod: 14, driftRef: 0.75, driftStrength: 0.3, atrToSigma: 1.3, stopMult: 2.0,
   regimeQuietPctile: 0.2, volAdapt: true, volAdaptLo: 0.85, volAdaptHi: 1.35, atrWindow: 168,
   multicycle: false, longMA: 160,
 };
