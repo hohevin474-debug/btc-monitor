@@ -8,27 +8,37 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - name: fetch online backtest & inspect new fields
+      - name: fetch online backtest & inspect full payload
         run: |
           set -e
-          URL="https://btc-monitor.hohevin474.workers.dev/api/backtest?limit=8"
-          curl -s "$URL" -o /tmp/bt.json
-          echo "=== raw size ==="; wc -c /tmp/bt.json
+          curl -s "https://btc-monitor.hohevin474.workers.dev/api/backtest?limit=200" -o /tmp/bt.json
+          echo "=== raw bytes ==="; wc -c /tmp/bt.json
           node -e '
             const fs=require("fs");
-            const raw=fs.readFileSync("/tmp/bt.json","utf8");
-            let top; try{ top=JSON.parse(raw); }catch(e){ console.log("PARSE_FAIL first200:", raw.slice(0,200)); process.exit(0); }
-            console.log("=== top-level keys ===", Object.keys(top));
-            const recs = top.records || top.data || top.trades || (Array.isArray(top)? top: null);
-            if(!recs){ console.log("NO records array; sample top:", JSON.stringify(top).slice(0,400)); process.exit(0); }
-            console.log("=== record count ===", recs.length);
-            const last = recs[recs.length-1];
-            console.log("=== last record keys ===", Object.keys(last));
-            console.log("=== last record (pretty) ===");
-            console.log(JSON.stringify(last, null, 1));
-            // 关键：新代码是否写入 stopPct / stopped 字段？
-            const hasStopPct = recs.some(r => r.stopPct !== undefined);
-            const hasStopped = recs.some(r => r.stopped !== undefined);
-            console.log("=== NEW-FIELDS-PRESENT stopPct:", hasStopPct, " stopped:", hasStopped, " ===");
-            if(last.time) console.log("=== last record time(UTC) ===", new Date(last.time*1000).toISOString());
+            const top=JSON.parse(fs.readFileSync("/tmp/bt.json","utf8"));
+            console.log("=== activeStrategy ===", top.activeStrategy);
+            console.log("=== pnl ===", JSON.stringify(top.pnl));
+            console.log("=== pnl6 ===", JSON.stringify(top.pnl6));
+            console.log("=== accuracy ===", JSON.stringify(top.accuracy));
+            console.log("=== accuracyAll ===", JSON.stringify(top.accuracyAll));
+            const recs = top.recent || [];
+            console.log("=== recent count ===", recs.length);
+            // 打印最近 6 条约简字段，重点看 stopPct/stopped 是否存在
+            const keys=[];
+            recs.slice(-6).forEach((r,i)=>{
+              if(i===0) console.log("=== recent[0] all keys ===", Object.keys(r));
+              const o={
+                time: r.time? new Date(r.time*1000).toISOString().slice(0,16): r.time,
+                dir: r.direction, price: r.price,
+                h24: r.h24, done: r.done, stopped: r.stopped,
+                stopPct: r.stopPct, pnl_h24: r.pnl_h24,
+                h24_hi: r.h24_hi, h24_lo: r.h24_lo
+              };
+              console.log("recent", i, JSON.stringify(o));
+            });
+            // 新字段巡检
+            const hasStopPct = recs.some(r=>r.stopPct!==undefined);
+            const hasStopped = recs.some(r=>r.stopped!==undefined);
+            const hasPnlH24  = recs.some(r=>r.pnl_h24!==undefined);
+            console.log("=== NEW-FIELDS stopPct:",hasStopPct," stopped:",hasStopped," pnl_h24:",hasPnlH24," ===");
           '
