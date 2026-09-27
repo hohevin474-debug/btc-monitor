@@ -17,18 +17,16 @@ jobs:
             const top=JSON.parse(fs.readFileSync("/tmp/bt.json","utf8"));
             const recs=top.recent||[];
             const v2=recs.filter(r=>r.strategy==="v2");
-            const t=(s)=>{ if(!s) return NaN; const d=new Date(s.replace(" ","T")+":00Z"); return d.getTime(); };
+            const t=(x)=>{ const n=Number(x); return isNaN(n)?NaN:n*1000; };
             const times=v2.map(r=>t(r.time)).filter(x=>!isNaN(x));
             console.log("recent total:", recs.length, " v2 in recent:", v2.length);
             if(times.length){ console.log("v2 time range:", new Date(Math.min(...times)).toISOString(), "->", new Date(Math.max(...times)).toISOString()); }
-            // 全优化部署时间：2026-09-26T15:30:42Z
             const deployMs=Date.parse("2026-09-26T15:30:42Z");
             const after=v2.filter(r=>t(r.time)>deployMs);
-            console.log("=== v2 records AFTER 全优化部署:", after.length, " ===");
-            console.log("=== v2 has stopPct field:", v2.some(r=>r.stopPct!==undefined), " stopped:", v2.some(r=>r.stopped!==undefined), " ===");
-            after.slice(0,12).forEach(r=>console.log("  after:", r.time, r.direction, "stopPct=",r.stopPct,"stopped=",r.stopped,"pnl_h24=",r.pnl_h24));
-            // 最早几条 v2（判断记录起点）
+            console.log("=== v2 records AFTER 全优化部署(2026-09-26T15:30:42Z):", after.length, " ===");
+            console.log("=== v2 has stopPct:", v2.some(r=>r.stopPct!==undefined), " stopped:", v2.some(r=>r.stopped!==undefined), " ===");
+            after.slice(0,12).forEach(r=>console.log("  after:", new Date(t(r.time)).toISOString(), r.direction, "stopPct=",r.stopPct,"stopped=",r.stopped,"pnl_h24=",r.pnl_h24));
             const sorted=[...v2].sort((a,b)=>t(a.time)-t(b.time));
             console.log("=== earliest 3 v2 ===");
-            sorted.slice(0,3).forEach(r=>console.log("  ", r.time, r.direction, "stopPct=",r.stopPct));
+            sorted.slice(0,3).forEach(r=>console.log("  ", new Date(t(r.time)).toISOString(), r.direction, "stopPct=",r.stopPct));
           '
