@@ -8,37 +8,27 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - name: fetch online backtest & inspect full payload
+      - name: inspect v2 records timeline & new fields
         run: |
           set -e
-          curl -s "https://btc-monitor.hohevin474.workers.dev/api/backtest?limit=200" -o /tmp/bt.json
-          echo "=== raw bytes ==="; wc -c /tmp/bt.json
+          curl -s "https://btc-monitor.hohevin474.workers.dev/api/backtest?limit=400" -o /tmp/bt.json
           node -e '
             const fs=require("fs");
             const top=JSON.parse(fs.readFileSync("/tmp/bt.json","utf8"));
-            console.log("=== activeStrategy ===", top.activeStrategy);
-            console.log("=== pnl ===", JSON.stringify(top.pnl));
-            console.log("=== pnl6 ===", JSON.stringify(top.pnl6));
-            console.log("=== accuracy ===", JSON.stringify(top.accuracy));
-            console.log("=== accuracyAll ===", JSON.stringify(top.accuracyAll));
-            const recs = top.recent || [];
-            console.log("=== recent count ===", recs.length);
-            // 打印最近 6 条约简字段，重点看 stopPct/stopped 是否存在
-            const keys=[];
-            recs.slice(-6).forEach((r,i)=>{
-              if(i===0) console.log("=== recent[0] all keys ===", Object.keys(r));
-              const o={
-                time: r.time? new Date(r.time*1000).toISOString().slice(0,16): r.time,
-                dir: r.direction, price: r.price,
-                h24: r.h24, done: r.done, stopped: r.stopped,
-                stopPct: r.stopPct, pnl_h24: r.pnl_h24,
-                h24_hi: r.h24_hi, h24_lo: r.h24_lo
-              };
-              console.log("recent", i, JSON.stringify(o));
-            });
-            // 新字段巡检
-            const hasStopPct = recs.some(r=>r.stopPct!==undefined);
-            const hasStopped = recs.some(r=>r.stopped!==undefined);
-            const hasPnlH24  = recs.some(r=>r.pnl_h24!==undefined);
-            console.log("=== NEW-FIELDS stopPct:",hasStopPct," stopped:",hasStopped," pnl_h24:",hasPnlH24," ===");
+            const recs=top.recent||[];
+            const v2=recs.filter(r=>r.strategy==="v2");
+            const t=(s)=>{ if(!s) return NaN; const d=new Date(s.replace(" ","T")+":00Z"); return d.getTime(); };
+            const times=v2.map(r=>t(r.time)).filter(x=>!isNaN(x));
+            console.log("recent total:", recs.length, " v2 in recent:", v2.length);
+            if(times.length){ console.log("v2 time range:", new Date(Math.min(...times)).toISOString(), "->", new Date(Math.max(...times)).toISOString()); }
+            // 全优化部署时间：2026-09-26T15:30:42Z
+            const deployMs=Date.parse("2026-09-26T15:30:42Z");
+            const after=v2.filter(r=>t(r.time)>deployMs);
+            console.log("=== v2 records AFTER 全优化部署:", after.length, " ===");
+            console.log("=== v2 has stopPct field:", v2.some(r=>r.stopPct!==undefined), " stopped:", v2.some(r=>r.stopped!==undefined), " ===");
+            after.slice(0,12).forEach(r=>console.log("  after:", r.time, r.direction, "stopPct=",r.stopPct,"stopped=",r.stopped,"pnl_h24=",r.pnl_h24));
+            // 最早几条 v2（判断记录起点）
+            const sorted=[...v2].sort((a,b)=>t(a.time)-t(b.time));
+            console.log("=== earliest 3 v2 ===");
+            sorted.slice(0,3).forEach(r=>console.log("  ", r.time, r.direction, "stopPct=",r.stopPct));
           '
