@@ -24,7 +24,7 @@ const BIG_MOVE_POINTS = 500;
 // plan A ①③：持仓管理常量（非重叠持仓 + 止损 / 移动止损）
 // 单笔持仓最多持有 24H（与策略目标窗口一致），期间不再开新仓 —— 对应回测
 // 「口径 B 非重叠」盈亏比从 1.06 升到 2.73 的核心改进（频率是主因）。
-const V2_POSITION_HOLD_SEC = 24 * 3600;
+const V2_POSITION_HOLD_SEC = 12 * 3600; // 持仓/冷却窗口：从 24h 放宽到 12h，破解 V2 在震荡市停摆
 // 止损距离 = ATR% × 倍数，再夹在 [下限, 上限] 之间（占价百分比）。
 // 动机：实盘 MAE(最大不利波动) 1315 ≫ MFE 871，亏时扛太久。止损把单笔最大亏损截断。
 const V2_STOP_MULT = 2.0;
@@ -414,7 +414,7 @@ const V2 = {
   //   LONG 0.45/SHORT 0.45 → LONG 均值 +627
   //   LONG 0.60/SHORT 0.45 → LONG 均值 +1072，整体 +828，盈亏比 4.03
   thresholdLong: 0.60,      // 做多门槛提高，过滤弱做多信号
-  thresholdShort: 0.55,     // 做空门槛提高（校准：更严过滤逆风段做空）
+  thresholdShort: 0.50,     // 做空门槛（校准0.55过严致V2停摆，回调至0.50，仍严于原始0.45）
   // 趋势对齐过滤（plan A ③）：只在均线趋势方向一致时开仓，杜绝逆势做多。
   // 做多需 maFast>maSlow（多头排列），做空需 maFast<maSlow（空头排列）。
   requireTrendAlign: true,
@@ -954,6 +954,48 @@ function summarizePnl(records, horizon = 'h24') {
   };
 }
 
+// 止损口径盈亏（plan B）：对每条记录重算「若带 ATR 移动止损」的实际盈亏。
+// 新记录（带 stopPct）会被 backfill 标记为 stopped（h24 已结算为止损价）；
+// 旧记录（无 stopPct）用默认 V2_STOP_MULT 估算，使历史成绩也能反映止损价值。
+// 这样线上 KPI 才真正体现"止损截亏"后的真实表现，而非虚拟 24H 终点价。
+function summarizePnlStop(records, horizon = 'h24') {
+  const list = records.filter(r => r[horizon] !== null && r[horizon] !== undefined);
+  if (!list.length) return null;
+  const pnls = list.map(r => {
+    const isLong = r.direction === 'LONG';
+    const entry = r.price;
+    const stopPct = r.stopPct ?? V2_STOP_MULT; // 旧记录无 stopPct，用默认倍数估算
+    let exit;
+    if (r.stopped) {
+      exit = r[horizon]; // backfill 已结算为止损价
+    } else {
+      const stop = isLong ? entry * (1 - stopPct / 100) : entry * (1 + stopPct / 100);
+      const lo = r[horizon + '_lo'] ?? entry;
+      const hi = r[horizon + '_hi'] ?? entry;
+      const hit = isLong ? lo <= stop : hi >= stop;
+      exit = hit ? stop : r[horizon]; // 触止损用止损价，否则用终点价
+    }
+    return isLong ? exit - entry : entry - exit;
+  });
+  const wins = pnls.filter(p => p > 0);
+  const losses = pnls.filter(p => p <= 0);
+  const sumW = wins.reduce((a, b) => a + b, 0);
+  const sumL = losses.reduce((a, b) => a + b, 0);
+  return {
+    horizon,
+    n: list.length,
+    total: Math.round(pnls.reduce((a, b) => a + b, 0)),
+    winRate: +(wins.length / list.length * 100).toFixed(1),
+    wins: wins.length, losses: losses.length,
+    avg: Math.round(pnls.reduce((a, b) => a + b, 0) / list.length),
+    avgWin: wins.length ? Math.round(sumW / wins.length) : 0,
+    avgLoss: losses.length ? Math.round(sumL / losses.length) : 0,
+    best: Math.round(Math.max(...pnls)),
+    worst: Math.round(Math.min(...pnls)),
+    pf: sumL < 0 ? +(sumW / -sumL).toFixed(2) : null,
+  };
+}
+
 // 统计准确率
 /**
  * 按「独立信号段」去重。
@@ -1411,6 +1453,9 @@ export default {
       // 战绩：按独立信号段去重后的真实盈亏（24H 窗口）
       const pnl = summarizePnl(dedupeSegments(activeRecords));
       const pnl6 = summarizePnl(dedupeSegments(activeRecords), 'h6');
+      // plan B：止损口径盈亏（新记录含 stopPct/stopped，旧记录用默认止损估算）
+      const pnlStop = summarizePnlStop(dedupeSegments(activeRecords));
+      const pnl6Stop = summarizePnlStop(dedupeSegments(activeRecords), 'h6');
       // 附带最近明细，limit 可放大（默认 20）
       const lim = Math.min(500, parseInt(url.searchParams.get('limit') || '20', 10));
       const recent = records.slice(-lim).map(r => {
@@ -1430,7 +1475,7 @@ export default {
         return o;
       });
       return new Response(JSON.stringify({
-        accuracy: acc, accuracyAll: accAll, recent, pnl, pnl6,
+        accuracy: acc, accuracyAll: accAll, recent, pnl, pnl6, pnlStop, pnl6Stop,
         activeStrategy: ACTIVE_STRATEGY,
       }), {
         status: 200,
