@@ -1,0 +1,44 @@
+name: temp-check
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/temp-check.yml'
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 抓取线上回测接口
+        run: |
+          URL="https://btc-monitor.hohevin474.workers.dev/api/backtest?limit=500"
+          for i in 1 2 3; do
+            curl -s -m 30 "$URL" -o /tmp/bt.json -w "HTTP %{http_code}\n" && break
+            sleep 3
+          done
+          node -e '
+          const d=JSON.parse(require("fs").readFileSync("/tmp/bt.json","utf8"));
+          const acc=d.accuracy||{}, accAll=d.accuracyAll||{};
+          const r=d.recent||[];
+          console.log("activeStrategy:", d.activeStrategy);
+          console.log("recent total:", r.length);
+          if(r.length){
+            const ts=r.map(x=>x.time).filter(Boolean);
+            const t0=new Date(Math.min(...ts)*1000).toISOString();
+            const t1=new Date(Math.max(...ts)*1000).toISOString();
+            console.log("recent time range:", t0, "->", t1);
+          }
+          console.log("=== accuracy (active v2) ===");
+          console.log(JSON.stringify(acc));
+          console.log("=== accuracy (all) ===");
+          console.log(JSON.stringify(accAll));
+          console.log("=== pnl (24H 去重) ===");
+          console.log(JSON.stringify(d.pnl));
+          console.log("=== pnl6 (6H 去重) ===");
+          console.log(JSON.stringify(d.pnl6));
+          // 最近 12 条明细（时间/方向/入场/概率/pnl24/状态）
+          console.log("=== 最近 12 条明细 ===");
+          r.slice(-12).forEach(x=>{
+            const tm=new Date((x.time||0)*1000).toISOString().slice(0,16);
+            console.log(`${tm} | ${x.strategy} | ${x.direction} | $${Math.round(x.price)} | prob=${(x.prob*100).toFixed(0)}% | pnl24=${x.pnl_h24} | done=${x.done}`);
+          });
+          '
