@@ -759,6 +759,24 @@ async function managePosition(env, state, price, nowSec) {
     `策略: 趋势跟随V2`,
   ].join('\n');
   if (!PAUSE_PUSH) await sendBark(title, body, 'passive', 'BTC-持仓管理');
+
+  // 战绩对齐推送：把实际持仓盈亏(realized)写回开仓时对应的 KV 记录，
+  // 使 /api/backtest 的 pnl 与用户收到的 Bark 离场推送完全一致。
+  try {
+    const records = await getBacktest(env);
+    const rec = records.find(r => r.id === pos.recordId)
+              || records.find(r => Math.abs(r.time - pos.entryTime) < 1);
+    if (rec) {
+      rec.realized = pnl;            // 实际盈亏点数（= 推送盈亏）
+      rec.realizedKind = exit.kind; // 止损 / 到期
+      rec.realizedAt = nowSec;
+      rec.done = true;
+      await saveBacktest(env, records);
+    }
+  } catch (e) {
+    console.error('写回实际盈亏失败:', e);
+  }
+
   state.open_pos = null; // 离场后允许下一笔开仓
   return true;
 }
@@ -931,9 +949,17 @@ function mfeMae(rec, horizon) {
  *    必须按方向折算：SHORT 用 price - h24，LONG 用 h24 - price。
  */
 function summarizePnl(records, horizon = 'h24') {
-  const list = records.filter(r => r[horizon] !== null && r[horizon] !== undefined);
-  if (!list.length) return null;
-  const pnls = list.map(r => (r.direction === 'SHORT' ? r.price - r[horizon] : r[horizon] - r.price));
+  let list, pnls;
+  if (horizon === 'realized') {
+    // 实际持仓盈亏（与 Bark 推送一致）：managePosition 离场时写回
+    list = records.filter(r => r.realized !== null && r.realized !== undefined);
+    if (!list.length) return { horizon, n: 0, total: 0, winRate: 0, wins: 0, losses: 0, avg: 0, avgWin: 0, avgLoss: 0, best: 0, worst: 0, pf: null };
+    pnls = list.map(r => r.realized);
+  } else {
+    list = records.filter(r => r[horizon] !== null && r[horizon] !== undefined);
+    if (!list.length) return { horizon, n: 0, total: 0, winRate: 0, wins: 0, losses: 0, avg: 0, avgWin: 0, avgLoss: 0, best: 0, worst: 0, pf: null };
+    pnls = list.map(r => (r.direction === 'SHORT' ? r.price - r[horizon] : r[horizon] - r.price));
+  }
   const wins = pnls.filter(p => p > 0);
   const losses = pnls.filter(p => p <= 0);
   const sumW = wins.reduce((a, b) => a + b, 0);
@@ -1340,6 +1366,7 @@ async function fetchAndAnalyze(env) {
           atrPct: signal.atrPct || 0.3,
           trailingActive: false,
           best: newPrice,
+          recordId: Math.round(nowSec * 1000),  // 关联开仓时 recordSignal 写的记录(id=毫秒)，离场时写回实际盈亏
         };
       }
     }
@@ -1451,8 +1478,11 @@ export default {
       // 全量统计保留，供 A/B 对比卡片使用
       const accAll = computeAccuracy(records);
       // 战绩：按独立信号段去重后的真实盈亏（24H 窗口）
-      const pnl = summarizePnl(dedupeSegments(activeRecords));
-      const pnl6 = summarizePnl(dedupeSegments(activeRecords), 'h6');
+      // 主战绩对齐推送：用实际持仓盈亏 realized（= Bark 离场推送盈亏）
+      const pnl = summarizePnl(activeRecords, 'realized');
+      // 历史旧口径参考（固定窗口终点价，与推送不完全一致，仅作对比）
+      const pnlH24 = summarizePnl(dedupeSegments(activeRecords), 'h24');
+      const pnl6 = summarizePnl(activeRecords, 'realized');
       // plan B：止损口径盈亏（新记录含 stopPct/stopped，旧记录用默认止损估算）
       const pnlStop = summarizePnlStop(dedupeSegments(activeRecords));
       const pnl6Stop = summarizePnlStop(dedupeSegments(activeRecords), 'h6');
@@ -1463,6 +1493,7 @@ export default {
           time: r.time, strategy: r.strategy || 'v1', direction: r.direction,
           price: r.price, prob: r.probability,
           h1: r.h1, h6: r.h6, h24: r.h24, done: r.done,
+          realized: r.realized ?? null, realizedKind: r.realizedKind ?? null,
         };
         // 逐笔盈亏（按方向折算，见 summarizePnl 的说明）
         for (const h of ['h1', 'h6', 'h24']) {
@@ -1475,7 +1506,7 @@ export default {
         return o;
       });
       return new Response(JSON.stringify({
-        accuracy: acc, accuracyAll: accAll, recent, pnl, pnl6, pnlStop, pnl6Stop,
+        accuracy: acc, accuracyAll: accAll, recent, pnl, pnlH24, pnl6, pnlStop, pnl6Stop,
         activeStrategy: ACTIVE_STRATEGY,
       }), {
         status: 200,
