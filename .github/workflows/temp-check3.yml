@@ -1,0 +1,47 @@
+name: temp-check3
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/temp-check3.yml'
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 抓取线上回测接口(增量对比)
+        run: |
+          URL="https://btc-monitor.hohevin474.workers.dev/api/backtest?limit=500"
+          for i in 1 2 3; do
+            curl -s -m 30 "$URL" -o /tmp/bt.json -w "HTTP %{http_code}\n" && break
+            sleep 3
+          done
+          node -e '
+          const d=JSON.parse(require("fs").readFileSync("/tmp/bt.json","utf8"));
+          const r=d.recent||[];
+          const v2=r.filter(x=>x.strategy==="v2");
+          const v2Times=v2.map(x=>x.time).filter(Boolean);
+          const ts=r.map(x=>x.time).filter(Boolean);
+          console.log("抓取时刻(UTC):", new Date().toISOString());
+          console.log("activeStrategy:", d.activeStrategy);
+          console.log("");
+          console.log("=== V2 去重战绩(active) ===");
+          console.log("pnl 24H(终点价):", JSON.stringify(d.pnl));
+          console.log("pnlStop 24H(止损):", JSON.stringify(d.pnlStop));
+          console.log("pnl6 6H(终点价):", JSON.stringify(d.pnl6));
+          console.log("pnl6Stop 6H(止损):", JSON.stringify(d.pnl6Stop));
+          console.log("");
+          console.log("=== 信号增量 ===");
+          console.log("recent 总条数:", r.length, "| v2 总条数(含细):", v2.length);
+          console.log("v2 最后信号时间:", v2Times.length? new Date(Math.max(...v2Times)*1000).toISOString() : "none");
+          console.log("recent 时间范围:", new Date(Math.min(...ts)*1000).toISOString(), "->", new Date(Math.max(...ts)*1000).toISOString());
+          // 进行中信号(done=false)
+          const open=r.filter(x=>x.done===false);
+          console.log("进行中(未到期)信号数:", open.length, open.length? "| 方向: "+open.map(x=>x.strategy+" "+x.direction).join(", ") : "");
+          // 最近 8 条 v2
+          console.log("");
+          console.log("=== 最近 8 条 V2 明细 ===");
+          v2.slice(-8).forEach(x=>{
+            const tm=new Date((x.time||0)*1000).toISOString().slice(0,16);
+            console.log(`${tm} | ${x.direction} | $${Math.round(x.price)} | prob=${(x.prob*100).toFixed(0)}% | pnl24=${x.pnl_h24} | done=${x.done}`);
+          });
+          '
