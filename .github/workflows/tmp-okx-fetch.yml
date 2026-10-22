@@ -1,0 +1,58 @@
+name: Tmp OKX 60d Fetch
+
+# 临时工作流：从 GitHub runner（美国机房，网络不受限）分页抓取 OKX BTC-USDT
+# 1H K线 ~1500 根（≈62 天），合并后上传为 artifact，供沙箱内做历史回放。
+# 用毕即删。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bars:
+        description: '目标根数（约 days*24）'
+        required: false
+        default: '1560'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch OKX 1H candles (paginated)
+        run: |
+          python3 - <<'PY'
+          import urllib.request, json, time
+          URL = "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=100"
+          bars = []
+          seen = set()
+          after = None
+          target = int("${{ github.event.inputs.bars }}")
+          for page in range(40):
+              u = URL + (f"&after={after}" if after else "")
+              req = urllib.request.Request(u, headers={"User-Agent":"Mozilla/5.0"})
+              data = json.load(urllib.request.urlopen(req, timeout=30))["data"]
+              if not data: break
+              for c in data:
+                  ts = int(c[0])
+                  if ts in seen: continue
+                  seen.add(ts)
+                  bars.append({"t": ts, "o":float(c[1]),"h":float(c[2]),"l":float(c[3]),"c":float(c[4]),"vol":float(c[5])})
+              after = data[-1][0]
+              if len(bars) >= target: break
+              time.sleep(0.25)
+          bars.sort(key=lambda x: x["t"])
+          # 去重保序
+          out = []
+          s2=set()
+          for b in bars:
+              if b["t"] in s2: continue
+              s2.add(b["t"]); out.append(b)
+          with open("/tmp/okx_60d.json","w") as f:
+              json.dump(out, f)
+          print("total bars:", len(out))
+          print("first:", out[0]["t"], "last:", out[-1]["t"])
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-60d
+          path: /tmp/okx_60d.json
+          retention-days: 3
