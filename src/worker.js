@@ -27,12 +27,21 @@ const BIG_MOVE_POINTS = 500;
 const V2_POSITION_HOLD_SEC = 12 * 3600; // 持仓/冷却窗口：从 24h 放宽到 12h，破解 V2 在震荡市停摆
 // 止损距离 = ATR% × 倍数，再夹在 [下限, 上限] 之间（占价百分比）。
 // 动机：实盘 MAE(最大不利波动) 1315 ≫ MFE 871，亏时扛太久。止损把单笔最大亏损截断。
-const V2_STOP_MULT = 2.0;
-const V2_STOP_MIN_PCT = 1.2;
-const V2_STOP_MAX_PCT = 3.0;
+const V2_STOP_MULT = 1.3;
+const V2_STOP_MIN_PCT = 0.7;
+const V2_STOP_MAX_PCT = 1.5;
 // 移动止损激活门槛（plan P1-3）：盈利达该倍数 ATR 后才启动追踪止损，
 // 此前保持初始止损位，避免刚开仓就被噪音扫损。
 const V2_TRAIL_ACTIVATE_ATR = 1.0;
+// 保本锁：盈利达该点数后把止损移到开仓价(±缓冲)，此后该笔不会亏损。
+// 直接压制"亏损太大"的体感，并拉高净盈利平仓率（≈高胜率的务实版本）。
+const V2_BE_POINTS = 250;
+const V2_BE_BUFFER = 0.001;            // 保本价相对开仓价的缓冲(0.1%)
+// 让利润奔跑：盈利超过该点数后，跟踪止损放宽到更宽轨道，目标捕捉 1000+ 大波。
+const V2_RUN_POINTS = 500;
+const V2_RUN_TRAIL_ATR = 2.2;          // 宽轨 = 2.2×ATR
+// 已保本的盈利单允许持有更久（最长 24H），让趋势充分展开去冲 1000+。
+const V2_POSITION_HOLD_SEC_PROFIT = 24 * 3600;
 // 多周期确认所用的"长周期"均线（单位=1H根数）。300根1H≈12.5天，160根≈6.7天≈近似日线趋势。
 const V2_LONG_MA = 160;
 
@@ -48,7 +57,7 @@ const ACTIVE_STRATEGY = 'v2';
 // 两者各取自身分布中较强的一部分，样本量才可比。
 // 注意：PUSH_MIN_PROB 依赖 ACTIVE_STRATEGY，必须定义在其后（否则 TDZ 报错）
 const PUSH_MIN_PROB_V1 = 0.5;
-const PUSH_MIN_PROB_V2 = 0.35;
+const PUSH_MIN_PROB_V2 = 0.45;
 const PUSH_MIN_PROB = ACTIVE_STRATEGY === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
 
 // 同一策略记录回测样本的最小间隔（秒）
@@ -725,6 +734,8 @@ async function managePosition(env, state, price, nowSec) {
   if (!pos) return false;
 
   const isLong = pos.dir === 'LONG';
+  // 当前浮动盈亏（点）
+  const profit = isLong ? price - pos.entry : pos.entry - price;
   // 移动止损激活门槛（plan P1-3）：盈利达 1×ATR 后才启动追踪止损，
   // 此前保持开仓时算好的初始止损位，避免刚开仓就被噪音扫损。
   const atr = pos.atrPct ? pos.entry * (pos.atrPct / 100) : 0;
@@ -732,18 +743,30 @@ async function managePosition(env, state, price, nowSec) {
     const activated = isLong ? price >= pos.entry + atr : price <= pos.entry - atr;
     if (activated) pos.trailingActive = true;
   }
+  // 保本锁：盈利达 +V2_BE_POINTS 后，把止损移到开仓价(±缓冲)，此后该笔不会亏损
+  if (profit >= V2_BE_POINTS) {
+    const be = isLong ? pos.entry * (1 + V2_BE_BUFFER) : pos.entry * (1 - V2_BE_BUFFER);
+    pos.stop = isLong ? Math.max(pos.stop, be) : Math.min(pos.stop, be);
+  }
   // 仅激活后：跟踪极值并上移止损，只收紧不放松
   if (pos.trailingActive) {
     pos.best = isLong ? Math.max(pos.best, price) : Math.min(pos.best, price);
-    pos.stop = isLong ? Math.max(pos.stop, pos.best * (1 - pos.stopPct / 100))
-                      : Math.min(pos.stop, pos.best * (1 + pos.stopPct / 100));
+    // 盈利越大、轨道越宽：超过 +V2_RUN_POINTS 后放宽到 2.2×ATR，让大波奔跑到 1000+
+    const trail = profit >= V2_RUN_POINTS
+      ? Math.max(pos.stopPct, V2_RUN_TRAIL_ATR * pos.atrPct)
+      : pos.stopPct;
+    pos.stop = isLong ? Math.max(pos.stop, pos.best * (1 - trail / 100))
+                      : Math.min(pos.stop, pos.best * (1 + trail / 100));
   }
 
   let exit = null;
   if (isLong && price <= pos.stop) exit = { kind: '止损', pnl: price - pos.entry };
   else if (!isLong && price >= pos.stop) exit = { kind: '止损', pnl: pos.entry - price };
   const held = nowSec - pos.entryTime;
-  if (!exit && held >= V2_POSITION_HOLD_SEC) {
+  // 已保本的盈利单给更长持仓窗口(V2_POSITION_HOLD_SEC_PROFIT)去冲 1000+；
+  // 未达保本的单仍用常规窗口(V2_POSITION_HOLD_SEC)，避免亏损单久扛。
+  const holdLimit = profit >= V2_BE_POINTS ? V2_POSITION_HOLD_SEC_PROFIT : V2_POSITION_HOLD_SEC;
+  if (!exit && held >= holdLimit) {
     exit = { kind: '到期', pnl: isLong ? price - pos.entry : pos.entry - price };
   }
   if (!exit) return false;
