@@ -1575,11 +1575,11 @@ export default {
     if (path === '/api/backtest') {
       const records = await getBacktest(env);
       const state = await getState(env);
-      // 部署决策：系统固定跑 V1（2026-10 关闭 V2）。主表只纳入 V1 实盘样本，
+      // 部署决策：系统固定跑 V1（2026-10 关闭 V2）。主表纳入 V1 全部样本——
+      // V1 信号逻辑未变，其 A/B 历史方向准确率≈53-57% 即 V1 真实水平，与回放验证一致；
       // V2 历史移入 accuracyAll(A/B 对比卡片)，不再污染主战绩 / PF。
-      const activeRecords = records.filter(r =>
-        r.strategy === 'v1' && ((r.realized !== null && r.realized !== undefined) || r.time >= REGIME_SWITCH_EPOCH)
-      );
+      // realized 盈亏只取实际交易过、有离场盈亏写回的 V1 记录，随部署后新交易累积。
+      const activeRecords = records.filter(r => r.strategy === 'v1');
       const acc = computeAccuracy(activeRecords);
       // 全量统计保留，供 A/B 对比卡片使用
       const accAll = computeAccuracy(records);
