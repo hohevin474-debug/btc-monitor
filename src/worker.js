@@ -1561,6 +1561,10 @@ export default {
         price: state.price,
         points: state.prices.length,
         last_update: state.last_update,
+        regime: state.regime || null,
+        active_strategy: state.active_strategy || null,
+        regimeWant: state.regimeWant || null,
+        regimeWantBars: state.regimeWantBars || 0,
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders },
