@@ -59,14 +59,15 @@ const REGIME_HYST_BARS = 12;     // 市况需连续 N 分钟确认才切换（�
 const REGIME_SWITCH_EPOCH = 1792640000;  // ≈ 2026-10-22 03:00 UTC
 // V1 均值回归专用参数（与 V2 趋势跟随是相反打法）
 const V1_STOP_MULT = 1.0, V1_STOP_MIN_PCT = 0.4, V1_STOP_MAX_PCT = 0.9;
-const V1_TP_PCT = 0.7;           // 均值回归止盈：价格回归均值即离场（≈600 点 @85000）
+const V1_TP_PCT = 0.9;           // 均值回归止盈：回放最优 0.9%（@85000≈765 点，vs 原 0.7%）
+const V1_MAX_HOLD_SEC = 6 * 3600; // 均值回归持仓上限 6H 强制平仓（回放验证 6h 优于 12h）
 // 多周期确认所用的"长周期"均线（单位=1H根数）。300根1H≈12.5天，160根≈6.7天≈近似日线趋势。
 const V2_LONG_MA = 160;
 
 // 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（新）
 // 两者始终并行计算并同时记录回测样本，此开关只决定推送哪一个。
 // 之所以并行：沙箱拿不到历史 K 线，无法离线回测，改用实盘 A/B 对比验证。
-const ACTIVE_STRATEGY = 'v2';
+const ACTIVE_STRATEGY = 'v1';
 
 // 推送/记录所需的最低概率。
 // V1 与 V2 的概率语义不同，必须用不同门槛，否则既不合理也破坏 A/B 公平性：
@@ -818,7 +819,9 @@ async function managePosition(env, state, price, nowSec) {
   else if (!exit && !isLong && price >= pos.stop) exit = { kind: '止损', pnl: pos.entry - price };
   const held = nowSec - pos.entryTime;
   // 已保本的盈利单(V2)给更长持仓窗口去冲 1000+；V1 用常规窗口(止盈/止损优先)
-  const holdLimit = (!isV1 && profit >= V2_BE_POINTS) ? V2_POSITION_HOLD_SEC_PROFIT : V2_POSITION_HOLD_SEC;
+  // V1 均值回归：固定 6H 上限（回放最优）；V2 已停用，仅保留分支兼容在途持仓。
+  const holdLimit = isV1 ? V1_MAX_HOLD_SEC
+    : (profit >= V2_BE_POINTS ? V2_POSITION_HOLD_SEC_PROFIT : V2_POSITION_HOLD_SEC);
   if (!exit && held >= holdLimit) {
     exit = { kind: '到期', pnl: isLong ? price - pos.entry : pos.entry - price };
   }
@@ -1325,22 +1328,19 @@ async function fetchAndAnalyze(env) {
   const signalV1 = analyze(newPrice, prices);
   const signalV2 = analyzeV2(klines, newPrice);
 
-  // —— 市况自适应（regime-adaptive）——
-  // ADX(趋势强度)+价格回归R²(方向一致性) 区分"真趋势"与"高ADX假突破震荡"。
-  // 震荡→切 V1 均值回归(赚 V2 亏的钱)；趋势→切 V2 趋势跟随(猎 1000+ 大波)。
+  // —— 市况自适应（regime-adaptive）已停用 ——
+  // 部署决策（2026-10）：回放验证 V2 趋势跟随 60 天负期望(PF 0.37 / 最大亏 -1117)，
+  // 是"亏损太大"的元凶；V1 均值回归优配(TP0.9%/6h/入场0.18) 60 天 +7610 / PF1.26 /
+  // 最大亏 -346，样本外两半区间均正。系统固定跑 V1，关闭 V2 与市况切换。
+  // regime 仍计算仅作可观测展示，不再据以切换策略。
   const regime = classifyRegime(klines);
-  const wantStrategy = regime === 'trend' ? 'v2' : 'v1';
   state.regime = regime;
-  if (state.regimeWant !== wantStrategy) { state.regimeWant = wantStrategy; state.regimeWantBars = 0; }
-  else state.regimeWantBars = (state.regimeWantBars || 0) + 1;
-  // 切换需市况连续确认 REGIME_HYST_BARS 分钟，且当前无持仓(避免持仓中翻策略)
-  if (state.active_strategy !== wantStrategy && state.regimeWantBars >= REGIME_HYST_BARS && !state.open_pos) {
-    state.active_strategy = wantStrategy;
-  }
-  if (!state.active_strategy) state.active_strategy = wantStrategy;
-  const active = state.active_strategy;
-  const signal = active === 'v2' ? signalV2 : signalV1;
-  const minProb = active === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
+  state.regimeWant = 'v1';
+  state.regimeWantBars = 0;
+  const active = 'v1';
+  state.active_strategy = active;
+  const signal = signalV1;
+  const minProb = PUSH_MIN_PROB_V1;
 
   // 更新状态
   state.price = newPrice;
@@ -1575,12 +1575,10 @@ export default {
     if (path === '/api/backtest') {
       const records = await getBacktest(env);
       const state = await getState(env);
-      // 主表纳入：V2 全量(主策略，保持历史连续性) + V1 仅自适应上线后的样本/实盘
-      // （此前 V1 只做 A/B 记录未实盘，其 9 月单边市旧样本会严重扭曲数字，已剔除）。
-      // 自适应上线后 V1 才真正参与交易，其实盘盈亏(realized)与新鲜样本才进入主表。
+      // 部署决策：系统固定跑 V1（2026-10 关闭 V2）。主表只纳入 V1 实盘样本，
+      // V2 历史移入 accuracyAll(A/B 对比卡片)，不再污染主战绩 / PF。
       const activeRecords = records.filter(r =>
-        r.strategy === 'v2' ||
-        (r.strategy === 'v1' && ((r.realized !== null && r.realized !== undefined) || r.time >= REGIME_SWITCH_EPOCH))
+        r.strategy === 'v1' && ((r.realized !== null && r.realized !== undefined) || r.time >= REGIME_SWITCH_EPOCH)
       );
       const acc = computeAccuracy(activeRecords);
       // 全量统计保留，供 A/B 对比卡片使用
