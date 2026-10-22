@@ -42,6 +42,24 @@ const V2_RUN_POINTS = 500;
 const V2_RUN_TRAIL_ATR = 2.2;          // 宽轨 = 2.2×ATR
 // 已保本的盈利单允许持有更久（最长 24H），让趋势充分展开去冲 1000+。
 const V2_POSITION_HOLD_SEC_PROFIT = 24 * 3600;
+
+// ============================================================
+// 市况自适应（regime-adaptive）：震荡切 V1 均值回归，趋势切 V2 趋势跟随
+// ============================================================
+// 分类阈值：ADX=趋势强度，R²=价格回归方向一致性。
+//   真趋势 = ADX 强 且 R² 高（价格真有方向漂移）
+//   高ADX震荡 = ADX 强 但 R² 低（波动大、方向反复，正是 V2 被扫损的市况）
+const REGIME_ADX_TREND = 25;
+const REGIME_ADX_FLAT = 18;
+const REGIME_R2_TREND = 0.45;
+const REGIME_R2_CHOP = 0.30;
+const REGIME_HYST_BARS = 12;     // 市况需连续 N 分钟确认才切换（防抖）
+// 市况自适应上线时间戳：此前 V1 只在 A/B 记录、未实盘，其旧样本(如 9 月单边市
+// 连开 21 条空单 0% 正确)会扭曲主表；以此epoch为界，只纳入此后 V1 样本/实盘。
+const REGIME_SWITCH_EPOCH = 1792640000;  // ≈ 2026-10-22 03:00 UTC
+// V1 均值回归专用参数（与 V2 趋势跟随是相反打法）
+const V1_STOP_MULT = 1.0, V1_STOP_MIN_PCT = 0.4, V1_STOP_MAX_PCT = 0.9;
+const V1_TP_PCT = 0.7;           // 均值回归止盈：价格回归均值即离场（≈600 点 @85000）
 // 多周期确认所用的"长周期"均线（单位=1H根数）。300根1H≈12.5天，160根≈6.7天≈近似日线趋势。
 const V2_LONG_MA = 160;
 
@@ -514,6 +532,35 @@ function calcADX(candles, n = 14) {
   return adx;
 }
 
+// 价格回归方向一致性：对最近 N 根收盘做线性回归，返回斜率(%/根)与 R²。
+// R² 高=价格沿单一方向漂移(真趋势)；R² 低=上下乱窜(震荡，哪怕 ADX 很高)。
+function trendScore(klines) {
+  const N = Math.min(120, klines.length);
+  if (N < 10) return { slopePct: 0, r2: 0 };
+  const ys = klines.slice(-N).map(k => k.c);
+  const n = N, mx = (n - 1) / 2;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxx = 0, sxy = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = i - mx, dy = ys[i] - my;
+    sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
+  }
+  const slope = sxy / sxx;
+  const r2 = syy > 0 ? (sxy * sxy) / (sxx * syy) : 0;
+  return { slopePct: (slope / my) * 100, r2 };
+}
+
+// 市况分类：返回 'trend' 或 'chop'。
+// 关键：用 R² 把"高ADX假突破震荡"识别出来（worker.js:440 自认 ADX 救不了那段）。
+function classifyRegime(klines) {
+  const adx = calcADX(klines) ?? 0;
+  const { r2 } = trendScore(klines);
+  if (adx >= REGIME_ADX_TREND && r2 >= REGIME_R2_TREND) return 'trend';
+  if (adx < REGIME_ADX_FLAT) return 'chop';
+  if (adx >= REGIME_ADX_TREND && r2 < REGIME_R2_CHOP) return 'chop'; // 高ADX无方向=最糟震荡
+  return r2 >= REGIME_R2_TREND ? 'trend' : 'chop';
+}
+
 function analyzeV2(klines, price) {
   // gates：推送三重门槛的实时体检数据。
   // 教训（2026-09-07）：连续 58 小时零推送，排查时才发现系统有 ATR / 强度 / 概率
@@ -752,20 +799,26 @@ async function managePosition(env, state, price, nowSec) {
   if (pos.trailingActive) {
     pos.best = isLong ? Math.max(pos.best, price) : Math.min(pos.best, price);
     // 盈利越大、轨道越宽：超过 +V2_RUN_POINTS 后放宽到 2.2×ATR，让大波奔跑到 1000+
-    const trail = profit >= V2_RUN_POINTS
+    // （仅 V2 趋势跟随启用；V1 均值回归靠止盈离场，不放大轨道）
+    const trail = (pos.strategy !== 'v1' && profit >= V2_RUN_POINTS)
       ? Math.max(pos.stopPct, V2_RUN_TRAIL_ATR * pos.atrPct)
       : pos.stopPct;
     pos.stop = isLong ? Math.max(pos.stop, pos.best * (1 - trail / 100))
                       : Math.min(pos.stop, pos.best * (1 + trail / 100));
   }
 
+  const isV1 = pos.strategy === 'v1';
   let exit = null;
-  if (isLong && price <= pos.stop) exit = { kind: '止损', pnl: price - pos.entry };
-  else if (!isLong && price >= pos.stop) exit = { kind: '止损', pnl: pos.entry - price };
+  // V1 均值回归：价格触及止盈位即离场（回归均值）
+  if (pos.takeProfit) {
+    if (isLong && price >= pos.takeProfit) exit = { kind: '止盈', pnl: price - pos.entry };
+    else if (!isLong && price <= pos.takeProfit) exit = { kind: '止盈', pnl: pos.entry - price };
+  }
+  if (!exit && isLong && price <= pos.stop) exit = { kind: '止损', pnl: price - pos.entry };
+  else if (!exit && !isLong && price >= pos.stop) exit = { kind: '止损', pnl: pos.entry - price };
   const held = nowSec - pos.entryTime;
-  // 已保本的盈利单给更长持仓窗口(V2_POSITION_HOLD_SEC_PROFIT)去冲 1000+；
-  // 未达保本的单仍用常规窗口(V2_POSITION_HOLD_SEC)，避免亏损单久扛。
-  const holdLimit = profit >= V2_BE_POINTS ? V2_POSITION_HOLD_SEC_PROFIT : V2_POSITION_HOLD_SEC;
+  // 已保本的盈利单(V2)给更长持仓窗口去冲 1000+；V1 用常规窗口(止盈/止损优先)
+  const holdLimit = (!isV1 && profit >= V2_BE_POINTS) ? V2_POSITION_HOLD_SEC_PROFIT : V2_POSITION_HOLD_SEC;
   if (!exit && held >= holdLimit) {
     exit = { kind: '到期', pnl: isLong ? price - pos.entry : pos.entry - price };
   }
@@ -779,7 +832,7 @@ async function managePosition(env, state, price, nowSec) {
     `离场: $${Math.round(price).toLocaleString('en-US')}`,
     `盈亏: ${pnl >= 0 ? '+' : ''}${pnl} 点 (${pnlPct}%)`,
     `持仓: ${(held / 3600).toFixed(1)} 小时`,
-    `策略: 趋势跟随V2`,
+    `策略: ${pos.strategy === 'v2' ? '趋势跟随V2' : '均值回归V1'}`,
   ].join('\n');
   if (!PAUSE_PUSH) await sendBark(title, body, 'passive', 'BTC-持仓管理');
 
@@ -1271,7 +1324,23 @@ async function fetchAndAnalyze(env) {
   // 技术分析：V1(均值回归) 与 V2(趋势跟随) 并行计算，用于 A/B 对比
   const signalV1 = analyze(newPrice, prices);
   const signalV2 = analyzeV2(klines, newPrice);
-  const signal = ACTIVE_STRATEGY === 'v2' ? signalV2 : signalV1;
+
+  // —— 市况自适应（regime-adaptive）——
+  // ADX(趋势强度)+价格回归R²(方向一致性) 区分"真趋势"与"高ADX假突破震荡"。
+  // 震荡→切 V1 均值回归(赚 V2 亏的钱)；趋势→切 V2 趋势跟随(猎 1000+ 大波)。
+  const regime = classifyRegime(klines);
+  const wantStrategy = regime === 'trend' ? 'v2' : 'v1';
+  state.regime = regime;
+  if (state.regimeWant !== wantStrategy) { state.regimeWant = wantStrategy; state.regimeWantBars = 0; }
+  else state.regimeWantBars = (state.regimeWantBars || 0) + 1;
+  // 切换需市况连续确认 REGIME_HYST_BARS 分钟，且当前无持仓(避免持仓中翻策略)
+  if (state.active_strategy !== wantStrategy && state.regimeWantBars >= REGIME_HYST_BARS && !state.open_pos) {
+    state.active_strategy = wantStrategy;
+  }
+  if (!state.active_strategy) state.active_strategy = wantStrategy;
+  const active = state.active_strategy;
+  const signal = active === 'v2' ? signalV2 : signalV1;
+  const minProb = active === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
 
   // 更新状态
   state.price = newPrice;
@@ -1285,7 +1354,7 @@ async function fetchAndAnalyze(env) {
   state.signal = signal;
   state.signal_v1 = signalV1;
   state.signal_v2 = signalV2;
-  state.active_strategy = ACTIVE_STRATEGY;
+  state.active_strategy = active;
   state.last_update = Date.now();
   state.update_count = (state.update_count || 0) + 1;
 
@@ -1323,7 +1392,7 @@ async function fetchAndAnalyze(env) {
   // 这是「一波行情只开一次仓、持满 24H」的实盘实现，对应回测口径 B 盈亏比 1.06→2.73。
   // 共振过滤（plan P1-4，默认关）：要求 V1/V2 同向才交易，进一步降频
   const resonate = !V2.resonance || (signalV1.direction === signal.direction);
-  if (signal.direction !== 'WAIT' && signal.probability >= PUSH_MIN_PROB && !state.open_pos && resonate) {
+  if (signal.direction !== 'WAIT' && signal.probability >= minProb && !state.open_pos && resonate) {
     if (!state.history) state.history = [];
     const lastHist = state.history[state.history.length - 1];
     if (!lastHist || lastHist.direction !== signal.direction || (nowSec - lastHist.time) > 300) {
@@ -1334,7 +1403,7 @@ async function fetchAndAnalyze(env) {
         probability: signal.probability,
         predicted_move: signal.predicted_move,
         confidence: signal.confidence,
-        strategy: ACTIVE_STRATEGY,
+        strategy: active,
       });
       if (state.history.length > 100) state.history.shift();
 
@@ -1354,12 +1423,20 @@ async function fetchAndAnalyze(env) {
         const title = `${emoji} ${dirCN}`;
         const horizon = signal.targetHorizon || 1;
 
-        // plan A ③：按 ATR 计算初始止损位，写进推送体并登记持仓
+        // plan A ③：按 ATR 计算初始止损位，写进推送体并登记持仓。
+        // V1/V2 用不同止损参数（相反打法）；V1 另设止盈位(均值回归离场)
         const isLong = signal.direction === 'LONG';
-        const stopPct = Math.min(V2_STOP_MAX_PCT,
-          Math.max(V2_STOP_MIN_PCT, (signal.atrPct || 0.3) * V2_STOP_MULT));
+        const isV1 = active === 'v1';
+        const sMult = isV1 ? V1_STOP_MULT : V2_STOP_MULT;
+        const sMin  = isV1 ? V1_STOP_MIN_PCT : V2_STOP_MIN_PCT;
+        const sMax  = isV1 ? V1_STOP_MAX_PCT : V2_STOP_MAX_PCT;
+        const atrPct = signal.atrPct || 0.3;
+        const stopPct = Math.min(sMax, Math.max(sMin, atrPct * sMult));
         const stopPrice = isLong ? newPrice * (1 - stopPct / 100)
                                  : newPrice * (1 + stopPct / 100);
+        const tpPct = isV1 ? V1_TP_PCT : 0;
+        const takeProfit = tpPct ? (isLong ? newPrice * (1 + tpPct / 100)
+                                            : newPrice * (1 - tpPct / 100)) : null;
 
         const body = [
           `${tag}`,
@@ -1370,7 +1447,7 @@ async function fetchAndAnalyze(env) {
           signal.rsi !== undefined ? `RSI: ${signal.rsi}` : null,
           signal.atrPct ? `波动率: ${signal.atrPct}%` : null,
           `建议止损: $${Math.round(stopPrice).toLocaleString('en-US')} (-${stopPct.toFixed(1)}%)`,
-          `策略: ${ACTIVE_STRATEGY === 'v2' ? '趋势跟随V2' : '均值回归V1'}`,
+          `策略: ${active === 'v2' ? '趋势跟随V2' : '均值回归V1'}${takeProfit ? `｜止盈 ${Math.round(takeProfit).toLocaleString('en-US')}` : ''}`,
         ].filter(Boolean).join('\n');
         // critical = 突破静音/专注模式；passive = 静默通知
         const urgency = isBigMove ? 'critical' : 'passive';
@@ -1386,7 +1463,9 @@ async function fetchAndAnalyze(env) {
           entryTime: nowSec,
           stop: stopPrice,
           stopPct,
-          atrPct: signal.atrPct || 0.3,
+          atrPct,
+          strategy: active,
+          takeProfit,
           trailingActive: false,
           best: newPrice,
           recordId: Math.round(nowSec * 1000),  // 关联开仓时 recordSignal 写的记录(id=毫秒)，离场时写回实际盈亏
@@ -1491,12 +1570,14 @@ export default {
     // API: 回测统计（真实准确率）
     if (path === '/api/backtest') {
       const records = await getBacktest(env);
-      // 主表只统计当前生效策略。已停用的 V1 样本会严重扭曲数字：
-      // 实测 V1（均值回归）在 2026-09 那波单边上涨里连开 21 条 24H 空单、
-      // 0% 正确（平均反向波动 3109 点、MAE −4057 点），混进总体统计后
-      // 把 24H 准确率压到 4.5%。那描述的是旧策略在单一行情下的失败，
-      // 跟当前系统水平无关，不该摆在面板主表。
-      const activeRecords = records.filter(r => (r.strategy || 'v1') === ACTIVE_STRATEGY);
+      const state = await getState(env);
+      // 主表纳入：V2 全量(主策略，保持历史连续性) + V1 仅自适应上线后的样本/实盘
+      // （此前 V1 只做 A/B 记录未实盘，其 9 月单边市旧样本会严重扭曲数字，已剔除）。
+      // 自适应上线后 V1 才真正参与交易，其实盘盈亏(realized)与新鲜样本才进入主表。
+      const activeRecords = records.filter(r =>
+        r.strategy === 'v2' ||
+        (r.strategy === 'v1' && ((r.realized !== null && r.realized !== undefined) || r.time >= REGIME_SWITCH_EPOCH))
+      );
       const acc = computeAccuracy(activeRecords);
       // 全量统计保留，供 A/B 对比卡片使用
       const accAll = computeAccuracy(records);
@@ -1530,7 +1611,8 @@ export default {
       });
       return new Response(JSON.stringify({
         accuracy: acc, accuracyAll: accAll, recent, pnl, pnlH24, pnl6, pnlStop, pnl6Stop,
-        activeStrategy: ACTIVE_STRATEGY,
+        activeStrategy: state.active_strategy || 'v2',
+        regime: state.regime || null,
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders },
