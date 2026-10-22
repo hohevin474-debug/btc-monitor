@@ -75,7 +75,7 @@ const ACTIVE_STRATEGY = 'v1';
 //   V2 = 正态模型 P(24H 内朝有利方向移动 ≥500 点)，典型值 0.35~0.55
 // 两者各取自身分布中较强的一部分，样本量才可比。
 // 注意：PUSH_MIN_PROB 依赖 ACTIVE_STRATEGY，必须定义在其后（否则 TDZ 报错）
-const PUSH_MIN_PROB_V1 = 0.5;
+const PUSH_MIN_PROB_V1 = 0.35;  // 修复哑火：原 0.5 高于 V1 常态概率(0.45-0.50)，导致永不触发；下调对齐回放口径
 const PUSH_MIN_PROB_V2 = 0.45;
 const PUSH_MIN_PROB = ACTIVE_STRATEGY === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
 
