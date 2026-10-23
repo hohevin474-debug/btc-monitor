@@ -884,7 +884,17 @@ function analyzeDv(klines, klines4h, price) {
 
   const cur = n - 1;
   const rsiNow = rsi[cur], rsiPrev = rsi[cur - 1], atrNow = atrP[cur], emaNow = emaP[cur];
-  const reasons = [`📊 RSI(14) ${rsiNow.toFixed(1)}（前值 ${rsiPrev.toFixed(1)}）｜ATR% ${atrNow.toFixed(2)}｜价 vs EMA20 ${closes[cur] > emaNow ? '上方' : '下方'}`];
+
+  // 4H 大周期趋势斜率（近 trend4Span 根=24h）。提前算，便于 WAIT 状态也可见（监控 4H 数据是否流动）
+  let t4slope = NaN;
+  if (klines4h && klines4h.length >= DV.trend4Span + 1) {
+    const m = klines4h.length;
+    const last4 = klines4h[m - 1].c, prev4 = klines4h[m - 1 - DV.trend4Span].c;
+    if (prev4 > 0) t4slope = (last4 - prev4) / prev4 * 100;
+  }
+  const t4txt = Number.isFinite(t4slope) ? `${t4slope >= 0 ? '+' : ''}${t4slope.toFixed(2)}%` : 'N/A';
+  const t4dir = Number.isFinite(t4slope) ? (t4slope >= DV.trend4SlopeMin ? '上升↑' : (t4slope <= -DV.trend4SlopeMin ? '下降↓' : '震荡→')) : '无数据';
+  const reasons = [`📊 RSI(14) ${rsiNow.toFixed(1)}（前值 ${rsiPrev.toFixed(1)}）｜ATR% ${atrNow.toFixed(2)}｜价 vs EMA20 ${closes[cur] > emaNow ? '上方' : '下方'}｜4H趋势 ${t4dir}(${t4txt})`];
 
   // 触发：RSI 穿越 42（回升→做多）/ 58（回落→做空）
   let direction = null;
@@ -893,7 +903,7 @@ function analyzeDv(klines, klines4h, price) {
   if (!direction) {
     return blank('😴 RSI 未现 42/58 顺势回调穿越，不参与', {
       atrPct: +atrNow.toFixed(2), reasons,
-      gates: { rsiNow: +rsiNow.toFixed(1), rsiLo: DV.rsiLo, rsiHi: DV.rsiHi },
+      gates: { rsiNow: +rsiNow.toFixed(1), rsiLo: DV.rsiLo, rsiHi: DV.rsiHi, t4slope: Number.isFinite(t4slope) ? +t4slope.toFixed(2) : null, t4dir },
     });
   }
   reasons.push(`🎯 RSI${direction === 'LONG' ? '回升破42' : '回落破58'}（${direction === 'LONG' ? '上升趋势中回调反弹' : '下降趋势中反弹回落'}）`);
@@ -917,13 +927,7 @@ function analyzeDv(klines, klines4h, price) {
   }
   reasons.push(`📐 真回调✓ (价${direction === 'LONG' ? '<' : '>'}EMA20)`);
 
-  // 门控③：4H 大周期趋势对齐（只在4H上升趋势中做多/下降趋势中做空）
-  let t4slope = NaN;
-  if (klines4h && klines4h.length >= DV.trend4Span + 1) {
-    const m = klines4h.length;
-    const last4 = klines4h[m - 1].c, prev4 = klines4h[m - 1 - DV.trend4Span].c;
-    if (prev4 > 0) t4slope = (last4 - prev4) / prev4 * 100;   // 4H 近 trend4Span 根(=24h) 斜率%
-  }
+  // 门控③：4H 大周期趋势对齐（t4slope 已在函数开头计算，此处只判定）
   if (!Number.isFinite(t4slope)) {
     return blank('⏳ 4H 趋势数据不足，暂不逆势开仓', {
       atrPct: +atrNow.toFixed(2), reasons,
