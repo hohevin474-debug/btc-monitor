@@ -64,20 +64,44 @@ const V1_MAX_HOLD_SEC = 6 * 3600; // 均值回归持仓上限 6H 强制平仓（
 // 多周期确认所用的"长周期"均线（单位=1H根数）。300根1H≈12.5天，160根≈6.7天≈近似日线趋势。
 const V2_LONG_MA = 160;
 
-// 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（新）
-// 两者始终并行计算并同时记录回测样本，此开关只决定推送哪一个。
+// 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（候选） / 'dv' = 波动率状态机（现生效）
+// 三者始终并行计算并同时记录回测样本，此开关只决定推送哪一个。
 // 之所以并行：沙箱拿不到历史 K 线，无法离线回测，改用实盘 A/B 对比验证。
-const ACTIVE_STRATEGY = 'v1';
+// 2026-10-22 部署决策：R4–R8 全量回放搜索(3000+组合/12+方法论)中，
+// D-vstate(波动率扩张→收缩转折后做均值回归) 全年 29 笔、胜率 72.4%、PF 3.28，
+// 上下半年分别 54.5%/83.3%，正期望稳健，为所有候选中最高胜率方案，故设为生效策略。
+const ACTIVE_STRATEGY = 'dv';
 
 // 推送/记录所需的最低概率。
 // V1 与 V2 的概率语义不同，必须用不同门槛，否则既不合理也破坏 A/B 公平性：
 //   V1 = 拍脑袋公式（predictedMove/500*0.35 + confidence*0.5 + ...），典型值 0.50~0.70
 //   V2 = 正态模型 P(24H 内朝有利方向移动 ≥500 点)，典型值 0.35~0.55
-// 两者各取自身分布中较强的一部分，样本量才可比。
+//   DV = 波动率状态机，probability 直接取历史实测胜率(0.72)
 // 注意：PUSH_MIN_PROB 依赖 ACTIVE_STRATEGY，必须定义在其后（否则 TDZ 报错）
 const PUSH_MIN_PROB_V1 = 0.35;  // 修复哑火：原 0.5 高于 V1 常态概率(0.45-0.50)，导致永不触发；下调对齐回放口径
 const PUSH_MIN_PROB_V2 = 0.45;
-const PUSH_MIN_PROB = ACTIVE_STRATEGY === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
+const PUSH_MIN_PROB_DV = 0.35;  // DV 触发即推送（其概率字段=实测胜率0.72，远高于此门槛）
+const PUSH_MIN_PROB = ACTIVE_STRATEGY === 'dv' ? PUSH_MIN_PROB_DV
+  : (ACTIVE_STRATEGY === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1);
+
+// ============================================================
+// D-vstate 策略配置：波动率状态机（高波动→低波动转折后做均值回归）
+// 回放验证（全年 8840 根 1H）：n=29，胜率 72.4%，PF 3.28；上下半年 54.5%/83.3%。
+// 机制：ATR 分位在 lookback 根前处于高位(扩张) 且 当前跌入低位(收缩) → 波动由大转小，
+//      价格回归均值(EMA20)，偏向回归方向开仓。TP=1000点 / SL=800点 / 持仓≤24h。
+// 触发稀有（约 1 次/12 天），故低频高胜率。
+// ============================================================
+const DV = {
+  atrWindow: 120,        // pctRank 回望窗口（根，≈5天）
+  lookback: 12,          // 对比多少根前（atrPct 须曾处于高位，≈12h）
+  hiPctile: 0.9,         // lookback 根前 atrPct 分位须 >= 此（曾高波动）
+  loPctile: 0.3,         // 当前 atrPct 分位须 <= 此（已收缩）
+  emaPeriod: 20,         // 回归锚（EMA20）
+  tpPoints: 1000,        // 止盈点数（@80000≈1.25%）
+  slPoints: 800,         // 止损点数
+  maxHoldSec: 24 * 3600, // 持仓上限（≤1天）
+  winRate: 0.72,         // 历史实测胜率，用作推送概率基准
+};
 
 // 同一策略记录回测样本的最小间隔（秒）
 const BT_RECORD_INTERVAL = 1800;   // 30 分钟：方向刚变化时用，保证新信号立刻留痕
@@ -771,6 +795,80 @@ function analyzeV2(klines, price) {
   };
 }
 
+/**
+ * D-vstate 信号：波动率状态机。
+ * 触发：ATR 分位在 lookback 根前处于高位(hiPctile) 且 当前跌入低位(loPctile)
+ *       → 波动由扩张转入收缩，价格趋于回归均值(EMA20)。
+ * 方向：价格低于 EMA20 → 做多回归；高于 → 做空回归（均值回归，非顺势）。
+ * 返回信号对象（direction / probability / predicted_move / atrPct ...），未触发返回 WAIT。
+ */
+function analyzeDv(klines, price) {
+  const blank = (reason, extra = {}) => ({
+    direction: 'WAIT', probability: 0, confidence: 0, predicted_move: 0,
+    score: 0, reasons: [reason], atrPct: 0, targetHorizon: 24, strategy: 'dv', ...extra,
+  });
+  if (!klines || klines.length < DV.atrWindow + DV.lookback + 14) {
+    return blank('⏳ K线积累中...');
+  }
+  const n = klines.length;
+  const closes = klines.map(k => k.c);
+  // 逐根 ATR（14）与 atrPct（占价%），与 klines 下标对齐
+  const atrPct = new Array(n).fill(null);
+  for (let i = 14; i < n; i++) {
+    let s = 0;
+    for (let j = i - 13; j <= i; j++) {
+      s += Math.max(
+        klines[j].h - klines[j].l,
+        Math.abs(klines[j].h - klines[j - 1].c),
+        Math.abs(klines[j].l - klines[j - 1].c),
+      );
+    }
+    const a = s / 14;
+    atrPct[i] = (a / klines[i].c) * 100;
+  }
+  const cur = n - 1, prev = n - 1 - DV.lookback;
+  if (atrPct[cur] == null || atrPct[prev] == null) return blank('⏳ ATR 计算中...');
+
+  // pctRank：下标 k 处的 atrPct 在近 atrWindow 根里的分位（越低=越压缩）
+  const pctRankAt = (k) => {
+    const start = Math.max(0, k - DV.atrWindow + 1);
+    const win = [];
+    for (let i = start; i <= k; i++) if (atrPct[i] != null) win.push(atrPct[i]);
+    if (!win.length) return 0.5;
+    const v = atrPct[k];
+    return win.filter(x => x <= v).length / win.length;
+  };
+  const rNow = pctRankAt(cur);
+  const rPrev = pctRankAt(prev);
+  const reasons = [`📊 波动率分位 当前 ${(rNow * 100).toFixed(0)}% / ${DV.lookback}根前 ${(rPrev * 100).toFixed(0)}%`];
+
+  // 触发条件：此前高波动(扩张) + 当前已收缩
+  if (!(rPrev >= DV.hiPctile && rNow <= DV.loPctile)) {
+    return blank('😴 波动率未现「扩张→收缩」转折，不参与', {
+      atrPct: +atrPct[cur].toFixed(3), reasons,
+      gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), lo: DV.loPctile, hi: DV.hiPctile },
+    });
+  }
+
+  // 方向：回归 EMA20（均值回归，非顺势）
+  const e20 = calcEMA(closes, DV.emaPeriod);
+  const direction = price < e20 ? 'LONG' : 'SHORT';
+  reasons.push(`🎯 波动率收缩+均值回归：${direction === 'LONG' ? '价格低于EMA20，做多回归 📈' : '价格高于EMA20，做空回归 📉'}`);
+
+  return {
+    direction,
+    probability: +DV.winRate.toFixed(2),   // 历史实测胜率作为概率基准
+    confidence: 0.6,
+    predicted_move: DV.tpPoints,            // 目标 1000 点 → 标记为重大行情(critical推送)
+    score: direction === 'LONG' ? 0.6 : -0.6,
+    reasons,
+    atrPct: +atrPct[cur].toFixed(3),
+    targetHorizon: 24,
+    strategy: 'dv',
+    gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), lo: DV.loPctile, hi: DV.hiPctile },
+  };
+}
+
 // ============================================================
 // 持仓管理（plan A ①③）：非重叠持仓 + 止损 / 移动止损 + 24H 到期
 // 每周期调用一次：更新移动止损、检测止损/到期离场。
@@ -782,30 +880,34 @@ async function managePosition(env, state, price, nowSec) {
   if (!pos) return false;
 
   const isLong = pos.dir === 'LONG';
+  const isDv = pos.strategy === 'dv';   // D-vstate：纯点值 TP/SL + 24h 硬上限，禁用 V2 追踪/保本机械
   // 当前浮动盈亏（点）
   const profit = isLong ? price - pos.entry : pos.entry - price;
   // 移动止损激活门槛（plan P1-3）：盈利达 1×ATR 后才启动追踪止损，
   // 此前保持开仓时算好的初始止损位，避免刚开仓就被噪音扫损。
-  const atr = pos.atrPct ? pos.entry * (pos.atrPct / 100) : 0;
-  if (!pos.trailingActive) {
-    const activated = isLong ? price >= pos.entry + atr : price <= pos.entry - atr;
-    if (activated) pos.trailingActive = true;
-  }
-  // 保本锁：盈利达 +V2_BE_POINTS 后，把止损移到开仓价(±缓冲)，此后该笔不会亏损
-  if (profit >= V2_BE_POINTS) {
-    const be = isLong ? pos.entry * (1 + V2_BE_BUFFER) : pos.entry * (1 - V2_BE_BUFFER);
-    pos.stop = isLong ? Math.max(pos.stop, be) : Math.min(pos.stop, be);
-  }
-  // 仅激活后：跟踪极值并上移止损，只收紧不放松
-  if (pos.trailingActive) {
-    pos.best = isLong ? Math.max(pos.best, price) : Math.min(pos.best, price);
-    // 盈利越大、轨道越宽：超过 +V2_RUN_POINTS 后放宽到 2.2×ATR，让大波奔跑到 1000+
-    // （仅 V2 趋势跟随启用；V1 均值回归靠止盈离场，不放大轨道）
-    const trail = (pos.strategy !== 'v1' && profit >= V2_RUN_POINTS)
-      ? Math.max(pos.stopPct, V2_RUN_TRAIL_ATR * pos.atrPct)
-      : pos.stopPct;
-    pos.stop = isLong ? Math.max(pos.stop, pos.best * (1 - trail / 100))
-                      : Math.min(pos.stop, pos.best * (1 + trail / 100));
+  // —— 仅 V1/V2 启用；DV 用固定点值止损(800)，不跟随此机械。
+  if (!isDv) {
+    const atr = pos.atrPct ? pos.entry * (pos.atrPct / 100) : 0;
+    if (!pos.trailingActive) {
+      const activated = isLong ? price >= pos.entry + atr : price <= pos.entry - atr;
+      if (activated) pos.trailingActive = true;
+    }
+    // 保本锁：盈利达 +V2_BE_POINTS 后，把止损移到开仓价(±缓冲)，此后该笔不会亏损
+    if (profit >= V2_BE_POINTS) {
+      const be = isLong ? pos.entry * (1 + V2_BE_BUFFER) : pos.entry * (1 - V2_BE_BUFFER);
+      pos.stop = isLong ? Math.max(pos.stop, be) : Math.min(pos.stop, be);
+    }
+    // 仅激活后：跟踪极值并上移止损，只收紧不放松
+    if (pos.trailingActive) {
+      pos.best = isLong ? Math.max(pos.best, price) : Math.min(pos.best, price);
+      // 盈利越大、轨道越宽：超过 +V2_RUN_POINTS 后放宽到 2.2×ATR，让大波奔跑到 1000+
+      // （仅 V2 趋势跟随启用；V1 均值回归靠止盈离场，不放大轨道）
+      const trail = (pos.strategy !== 'v1' && profit >= V2_RUN_POINTS)
+        ? Math.max(pos.stopPct, V2_RUN_TRAIL_ATR * pos.atrPct)
+        : pos.stopPct;
+      pos.stop = isLong ? Math.max(pos.stop, pos.best * (1 - trail / 100))
+                        : Math.min(pos.stop, pos.best * (1 + trail / 100));
+    }
   }
 
   const isV1 = pos.strategy === 'v1';
@@ -818,10 +920,12 @@ async function managePosition(env, state, price, nowSec) {
   if (!exit && isLong && price <= pos.stop) exit = { kind: '止损', pnl: price - pos.entry };
   else if (!exit && !isLong && price >= pos.stop) exit = { kind: '止损', pnl: pos.entry - price };
   const held = nowSec - pos.entryTime;
+  // DV 波动率状态机：固定 24h 硬上限（≤1天要求）
   // 已保本的盈利单(V2)给更长持仓窗口去冲 1000+；V1 用常规窗口(止盈/止损优先)
   // V1 均值回归：固定 6H 上限（回放最优）；V2 已停用，仅保留分支兼容在途持仓。
-  const holdLimit = isV1 ? V1_MAX_HOLD_SEC
-    : (profit >= V2_BE_POINTS ? V2_POSITION_HOLD_SEC_PROFIT : V2_POSITION_HOLD_SEC);
+  const holdLimit = isDv ? DV.maxHoldSec
+    : (isV1 ? V1_MAX_HOLD_SEC
+      : (profit >= V2_BE_POINTS ? V2_POSITION_HOLD_SEC_PROFIT : V2_POSITION_HOLD_SEC));
   if (!exit && held >= holdLimit) {
     exit = { kind: '到期', pnl: isLong ? price - pos.entry : pos.entry - price };
   }
@@ -835,7 +939,7 @@ async function managePosition(env, state, price, nowSec) {
     `离场: $${Math.round(price).toLocaleString('en-US')}`,
     `盈亏: ${pnl >= 0 ? '+' : ''}${pnl} 点 (${pnlPct}%)`,
     `持仓: ${(held / 3600).toFixed(1)} 小时`,
-    `策略: ${pos.strategy === 'v2' ? '趋势跟随V2' : '均值回归V1'}`,
+    `策略: ${pos.strategy === 'dv' ? '波动率状态机D-vstate' : (pos.strategy === 'v2' ? '趋势跟随V2' : '均值回归V1')}`,
   ].join('\n');
   if (!PAUSE_PUSH) await sendBark(title, body, 'passive', 'BTC-持仓管理');
 
@@ -1170,9 +1274,9 @@ function computeAccuracy(records, target = BIG_MOVE_POINTS) {
   const big = records.filter(r => (r.predicted_move || 0) >= BIG_MOVE_POINTS);
   const normal = records.filter(r => (r.predicted_move || 0) < BIG_MOVE_POINTS);
 
-  // 策略 A/B 对比（v1 现行 / v2 候选），用实盘表现代替历史回测
+  // 策略 A/B 对比（v1 / v2 / dv 三策略并行记录，用实盘表现代替历史回测）
   const byStrategy = {};
-  for (const s of ['v1', 'v2']) {
+  for (const s of ['v1', 'v2', 'dv']) {
     const pool = records.filter(r => (r.strategy || 'v1') === s);
     if (!pool.length) continue;
     byStrategy[s] = {
@@ -1324,23 +1428,26 @@ async function fetchAndAnalyze(env) {
   state.local_high_24h = localHigh;
   state.local_low_24h = localLow;
 
-  // 技术分析：V1(均值回归) 与 V2(趋势跟随) 并行计算，用于 A/B 对比
+  // 技术分析：V1(均值回归) 与 V2(趋势跟随) 并行计算，D-vstate(波动率状态机) 现生效，三者在 A/B 记录
   const signalV1 = analyze(newPrice, prices);
   const signalV2 = analyzeV2(klines, newPrice);
+  const signalDv = analyzeDv(klines, newPrice);
 
   // —— 市况自适应（regime-adaptive）已停用 ——
   // 部署决策（2026-10）：回放验证 V2 趋势跟随 60 天负期望(PF 0.37 / 最大亏 -1117)，
   // 是"亏损太大"的元凶；V1 均值回归优配(TP0.9%/6h/入场0.18) 60 天 +7610 / PF1.26 /
   // 最大亏 -346，样本外两半区间均正。系统固定跑 V1，关闭 V2 与市况切换。
+  // 2026-10-22：全量回放搜索(3000+组合)后，D-vstate 以 72.4% 胜率/PF3.28 胜出，设为生效策略。
   // regime 仍计算仅作可观测展示，不再据以切换策略。
   const regime = classifyRegime(klines);
   state.regime = regime;
-  state.regimeWant = 'v1';
+  state.regimeWant = 'dv';
   state.regimeWantBars = 0;
-  const active = 'v1';
+  const active = ACTIVE_STRATEGY;        // 'dv'
   state.active_strategy = active;
-  const signal = signalV1;
-  const minProb = PUSH_MIN_PROB_V1;
+  const signal = active === 'dv' ? signalDv : signalV1;
+  const minProb = active === 'dv' ? PUSH_MIN_PROB_DV
+    : (active === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1);
 
   // 更新状态
   state.price = newPrice;
@@ -1354,6 +1461,7 @@ async function fetchAndAnalyze(env) {
   state.signal = signal;
   state.signal_v1 = signalV1;
   state.signal_v2 = signalV2;
+  state.signal_dv = signalDv;
   state.active_strategy = active;
   state.last_update = Date.now();
   state.update_count = (state.update_count || 0) + 1;
@@ -1365,12 +1473,13 @@ async function fetchAndAnalyze(env) {
   // plan A ①③：先处理已有持仓的止损 / 移动止损 / 到期离场（每周期必跑，与记录/推送解耦）
   await managePosition(env, state, newPrice, nowSec);
 
-  // ---- A/B 样本记录：两个策略各自独立记录，用实盘表现对比 ----
+  // ---- A/B 样本记录：三策略各自独立记录，用实盘表现对比 ----
   // 间隔 30 分钟而非 5 分钟：相邻信号高度重叠不构成独立样本，
   // 拉长间隔可提升统计显著性，同时避免 KV 记录数暴涨
-  for (const [tag, sig] of [['v1', signalV1], ['v2', signalV2]]) {
+  for (const [tag, sig] of [['v1', signalV1], ['v2', signalV2], ['dv', signalDv]]) {
     if (!sig || sig.direction === 'WAIT') continue;
-    const minProb = tag === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1;
+    const minProb = tag === 'v2' ? PUSH_MIN_PROB_V2
+      : (tag === 'dv' ? PUSH_MIN_PROB_DV : PUSH_MIN_PROB_V1);
     if ((sig.probability || 0) < minProb) continue;
     const lastKey = `last_bt_${tag}`;
     const lastDirKey = `last_bt_dir_${tag}`;
@@ -1380,10 +1489,13 @@ async function fetchAndAnalyze(env) {
     if (nowSec - (state[lastKey] || 0) < interval) continue;
     state[lastKey] = nowSec;
     state[lastDirKey] = sig.direction;
-    // 仅 V2 记录止损幅度（V1 不交易，止损无意义）
-    const stopPct = (tag === 'v2' && sig.atrPct)
-      ? Math.min(V2_STOP_MAX_PCT, Math.max(V2_STOP_MIN_PCT, sig.atrPct * V2_STOP_MULT))
-      : null;
+    // V2 记录 ATR 止损幅度；DV 记录固定点值止损幅度(800点→百分比)，供回测止损记账
+    let stopPct = null;
+    if (tag === 'v2' && sig.atrPct) {
+      stopPct = Math.min(V2_STOP_MAX_PCT, Math.max(V2_STOP_MIN_PCT, sig.atrPct * V2_STOP_MULT));
+    } else if (tag === 'dv' && sig.atrPct) {
+      stopPct = (DV.slPoints / newPrice) * 100;
+    }
     await recordSignal(env, sig, newPrice, now, tag, stopPct);
   }
 
@@ -1423,20 +1535,27 @@ async function fetchAndAnalyze(env) {
         const title = `${emoji} ${dirCN}`;
         const horizon = signal.targetHorizon || 1;
 
-        // plan A ③：按 ATR 计算初始止损位，写进推送体并登记持仓。
-        // V1/V2 用不同止损参数（相反打法）；V1 另设止盈位(均值回归离场)
+        // plan A ③：按策略类型计算止盈/止损位并登记持仓。
+        // V1/V2 用 ATR 百分比止损（相反打法）；DV 用固定点值(TP=1000/SL=800)
         const isLong = signal.direction === 'LONG';
-        const isV1 = active === 'v1';
-        const sMult = isV1 ? V1_STOP_MULT : V2_STOP_MULT;
-        const sMin  = isV1 ? V1_STOP_MIN_PCT : V2_STOP_MIN_PCT;
-        const sMax  = isV1 ? V1_STOP_MAX_PCT : V2_STOP_MAX_PCT;
-        const atrPct = signal.atrPct || 0.3;
-        const stopPct = Math.min(sMax, Math.max(sMin, atrPct * sMult));
-        const stopPrice = isLong ? newPrice * (1 - stopPct / 100)
-                                 : newPrice * (1 + stopPct / 100);
-        const tpPct = isV1 ? V1_TP_PCT : 0;
-        const takeProfit = tpPct ? (isLong ? newPrice * (1 + tpPct / 100)
+        let stopPrice, takeProfit, stopPct, tpPct = 0, atrPct = signal.atrPct || 0.3;
+        if (active === 'dv') {
+          const tp = DV.tpPoints, sl = DV.slPoints;
+          stopPrice = isLong ? newPrice - sl : newPrice + sl;
+          takeProfit = isLong ? newPrice + tp : newPrice - tp;
+          stopPct = (sl / newPrice) * 100;   // 用于回测止损记账(%)
+        } else {
+          const isV1 = active === 'v1';
+          const sMult = isV1 ? V1_STOP_MULT : V2_STOP_MULT;
+          const sMin  = isV1 ? V1_STOP_MIN_PCT : V2_STOP_MIN_PCT;
+          const sMax  = isV1 ? V1_STOP_MAX_PCT : V2_STOP_MAX_PCT;
+          stopPct = Math.min(sMax, Math.max(sMin, atrPct * sMult));
+          stopPrice = isLong ? newPrice * (1 - stopPct / 100)
+                               : newPrice * (1 + stopPct / 100);
+          tpPct = isV1 ? V1_TP_PCT : 0;
+          takeProfit = tpPct ? (isLong ? newPrice * (1 + tpPct / 100)
                                             : newPrice * (1 - tpPct / 100)) : null;
+        }
 
         const body = [
           `${tag}`,
@@ -1447,7 +1566,7 @@ async function fetchAndAnalyze(env) {
           signal.rsi !== undefined ? `RSI: ${signal.rsi}` : null,
           signal.atrPct ? `波动率: ${signal.atrPct}%` : null,
           `建议止损: $${Math.round(stopPrice).toLocaleString('en-US')} (-${stopPct.toFixed(1)}%)`,
-          `策略: ${active === 'v2' ? '趋势跟随V2' : '均值回归V1'}${takeProfit ? `｜止盈 ${Math.round(takeProfit).toLocaleString('en-US')}` : ''}`,
+          `策略: ${active === 'dv' ? '波动率状态机D-vstate' : (active === 'v2' ? '趋势跟随V2' : '均值回归V1')}${takeProfit ? `｜止盈 ${Math.round(takeProfit).toLocaleString('en-US')}` : ''}`,
         ].filter(Boolean).join('\n');
         // critical = 突破静音/专注模式；passive = 静默通知
         const urgency = isBigMove ? 'critical' : 'passive';
@@ -1579,7 +1698,8 @@ export default {
       // V1 信号逻辑未变，其 A/B 历史方向准确率≈53-57% 即 V1 真实水平，与回放验证一致；
       // V2 历史移入 accuracyAll(A/B 对比卡片)，不再污染主战绩 / PF。
       // realized 盈亏只取实际交易过、有离场盈亏写回的 V1 记录，随部署后新交易累积。
-      const activeRecords = records.filter(r => r.strategy === 'v1');
+      const active = state.active_strategy || 'v1';
+      const activeRecords = records.filter(r => r.strategy === active);
       const acc = computeAccuracy(activeRecords);
       // 全量统计保留，供 A/B 对比卡片使用
       const accAll = computeAccuracy(records);

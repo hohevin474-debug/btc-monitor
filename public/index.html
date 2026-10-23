@@ -343,7 +343,7 @@ try{
 let r=await fetch(API_BASE+'/api/backtest?t='+Date.now()),d=await r.json();
 let acc=d.accuracy||{};
 // 主表仅统计当前生效策略；A/B 对比卡片另用全量数据（d.accuracyAll）
-let stratName=(d.activeStrategy==='v2')?'V2 趋势跟随':'V1 均值回归';
+let stratName=(d.activeStrategy==='dv')?'D-vstate 波动率状态机':(d.activeStrategy==='v2')?'V2 趋势跟随':'V1 均值回归';
 document.getElementById('btTotal').textContent='累计 '+acc.total+' 条 '+stratName+' 记录（已排除停用策略样本）';
 let rows=(acc.windows||[]).map(w=>{
 if(!w.n) return '<tr><td>'+w.label+'</td><td colspan="6" style="text-align:center;color:var(--sub)">样本不足</td></tr>';
@@ -371,7 +371,7 @@ document.getElementById('btTier').textContent=tierTxt;
 // 策略 A/B 对比：必须用全量数据（accuracyAll），
 // 因为 d.accuracy 已被过滤成只剩当前策略
 let ab=(d.accuracyAll||{}).byStrategy||acc.byStrategy||{};
-let names={v1:'V1 均值回归',v2:'V2 趋势跟随'};
+let names={v1:'V1 均值回归',v2:'V2 趋势跟随',dv:'D-vstate 波动率状态机'};
 let abRows=Object.keys(ab).map(k=>{
 let s=ab[k];
 let w24=(s.windows||[])[2]||{};
