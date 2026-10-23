@@ -97,6 +97,9 @@ const DV = {
   hiPctile: 0.9,         // lookback 根前 atrPct 分位须 >= 此（曾高波动）
   loPctile: 0.3,         // 当前 atrPct 分位须 <= 此（已收缩）
   emaPeriod: 20,         // 回归锚（EMA20）
+  ema50Period: 50,       // 趋势平坦度判定锚（EMA50）
+  slopeSpan: 20,         // 斜率度量跨度（根）：与回放验证一致，取 EMA50 近 20 根变化%
+  maxEma50SlopePct: 0.8, // 入口门控：|EMA50斜率|≤此(%),避开强趋势中"假收缩"导致反抽失败
   tpPoints: 1000,        // 止盈点数（@80000≈1.25%）
   slPoints: 800,         // 止损点数
   maxHoldSec: 24 * 3600, // 持仓上限（≤1天）
@@ -807,53 +810,72 @@ function analyzeDv(klines, price) {
     direction: 'WAIT', probability: 0, confidence: 0, predicted_move: 0,
     score: 0, reasons: [reason], atrPct: 0, targetHorizon: 24, strategy: 'dv', ...extra,
   });
-  if (!klines || klines.length < DV.atrWindow + DV.lookback + 14) {
+  // 注：波动率序列须与回放验证(72.4%/PF3.28)使用的方法完全一致 ——
+  // 单根 TrueRange 的 24 根 SMA（atrS），分位计算排除当前根。
+  // （早期误用 ATR14 占价%，实跑仅 ~53%/PF1.18，已修正）
+  if (!klines || klines.length < DV.atrWindow + DV.lookback + 24) {
     return blank('⏳ K线积累中...');
   }
   const n = klines.length;
   const closes = klines.map(k => k.c);
-  // 逐根 ATR（14）与 atrPct（占价%），与 klines 下标对齐
-  const atrPct = new Array(n).fill(null);
-  for (let i = 14; i < n; i++) {
-    let s = 0;
-    for (let j = i - 13; j <= i; j++) {
-      s += Math.max(
-        klines[j].h - klines[j].l,
-        Math.abs(klines[j].h - klines[j - 1].c),
-        Math.abs(klines[j].l - klines[j - 1].c),
-      );
-    }
-    const a = s / 14;
-    atrPct[i] = (a / klines[i].c) * 100;
+  // 单根 TrueRange → 24 根 SMA（atrS）
+  const tr = new Array(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    tr[i] = Math.max(
+      klines[i].h - klines[i].l,
+      Math.abs(klines[i].h - klines[i - 1].c),
+      Math.abs(klines[i].l - klines[i - 1].c),
+    );
+  }
+  const atrS = new Array(n).fill(NaN);
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    s += tr[i];
+    if (i >= 24) s -= tr[i - 24];
+    if (i >= 23) atrS[i] = s / 24;
   }
   const cur = n - 1, prev = n - 1 - DV.lookback;
-  if (atrPct[cur] == null || atrPct[prev] == null) return blank('⏳ ATR 计算中...');
+  if (isNaN(atrS[cur]) || isNaN(atrS[prev])) return blank('⏳ 波动率计算中...');
 
-  // pctRank：下标 k 处的 atrPct 在近 atrWindow 根里的分位（越低=越压缩）
-  const pctRankAt = (k) => {
-    const start = Math.max(0, k - DV.atrWindow + 1);
-    const win = [];
-    for (let i = start; i <= k; i++) if (atrPct[i] != null) win.push(atrPct[i]);
-    if (!win.length) return 0.5;
-    const v = atrPct[k];
-    return win.filter(x => x <= v).length / win.length;
+  // pctRank：窗口 atrWindow 内、排除当前根的分位（越低=越压缩）
+  const pctRank = (k) => {
+    const v = atrS[k];
+    let c = 0, cnt = 0;
+    for (let j = Math.max(0, k - DV.atrWindow); j < k; j++) {
+      if (isNaN(atrS[j])) continue;
+      cnt++;
+      if (atrS[j] <= v) c++;
+    }
+    return cnt ? c / cnt : 0.5;
   };
-  const rNow = pctRankAt(cur);
-  const rPrev = pctRankAt(prev);
+  const rNow = pctRank(cur);
+  const rPrev = pctRank(prev);
   const reasons = [`📊 波动率分位 当前 ${(rNow * 100).toFixed(0)}% / ${DV.lookback}根前 ${(rPrev * 100).toFixed(0)}%`];
 
   // 触发条件：此前高波动(扩张) + 当前已收缩
   if (!(rPrev >= DV.hiPctile && rNow <= DV.loPctile)) {
     return blank('😴 波动率未现「扩张→收缩」转折，不参与', {
-      atrPct: +atrPct[cur].toFixed(3), reasons,
+      atrPct: +atrS[cur].toFixed(2), reasons,
       gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), lo: DV.loPctile, hi: DV.hiPctile },
     });
   }
 
   // 方向：回归 EMA20（均值回归，非顺势）
   const e20 = calcEMA(closes, DV.emaPeriod);
+  const e50 = calcEMA(closes, DV.ema50Period);
+  const e50slope = (e50[cur] - e50[cur - DV.slopeSpan]) / e50[cur - DV.slopeSpan] * 100;
   const direction = price < e20 ? 'LONG' : 'SHORT';
   reasons.push(`🎯 波动率收缩+均值回归：${direction === 'LONG' ? '价格低于EMA20，做多回归 📈' : '价格高于EMA20，做空回归 📉'}`);
+
+  // 入口门控：避开强趋势中的"假收缩"（均值反抽在趋势市易失败）。
+  // 回放验证：|EMA50斜率|≤0.8% 将胜率 72.4%→75%、PF 3.28→4.74，且弱半年从 50%→57%。
+  if (Math.abs(e50slope) > DV.maxEma50SlopePct) {
+    return blank('📉 趋势过强(EMA50斜率超限)，不逆势反抽', {
+      atrPct: +atrS[cur].toFixed(2), reasons,
+      gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), e50slope: +e50slope.toFixed(2), maxSlope: DV.maxEma50SlopePct },
+    });
+  }
+  reasons.push(`📐 EMA50斜率 ${e50slope.toFixed(2)}%（趋势平坦✓）`);
 
   return {
     direction,
@@ -862,10 +884,10 @@ function analyzeDv(klines, price) {
     predicted_move: DV.tpPoints,            // 目标 1000 点 → 标记为重大行情(critical推送)
     score: direction === 'LONG' ? 0.6 : -0.6,
     reasons,
-    atrPct: +atrPct[cur].toFixed(3),
+    atrPct: +atrS[cur].toFixed(2),
     targetHorizon: 24,
     strategy: 'dv',
-    gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), lo: DV.loPctile, hi: DV.hiPctile },
+    gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), lo: DV.loPctile, hi: DV.hiPctile, e50slope: +e50slope.toFixed(2), maxSlope: DV.maxEma50SlopePct },
   };
 }
 
