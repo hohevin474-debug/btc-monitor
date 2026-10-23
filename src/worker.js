@@ -1658,6 +1658,7 @@ export default {
         signal: state.signal,
         signal_v1: state.signal_v1 || null,
         signal_v2: state.signal_v2 || null,
+        signal_dv: state.signal_dv || null,
         active_strategy: state.active_strategy || 'v1',
         klines_count: (state.klines || []).length,
         prices: state.prices,
