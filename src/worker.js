@@ -64,46 +64,43 @@ const V1_MAX_HOLD_SEC = 6 * 3600; // 均值回归持仓上限 6H 强制平仓（
 // 多周期确认所用的"长周期"均线（单位=1H根数）。300根1H≈12.5天，160根≈6.7天≈近似日线趋势。
 const V2_LONG_MA = 160;
 
-// 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（候选） / 'dv' = 波动率状态机（现生效）
+// 推送所用策略：'v1' = 均值回归（原） / 'v2' = 趋势跟随（候选） / 'dv' = RSI回归+波动过滤（现生效）
 // 三者始终并行计算并同时记录回测样本，此开关只决定推送哪一个。
 // 之所以并行：沙箱拿不到历史 K 线，无法离线回测，改用实盘 A/B 对比验证。
-// 2026-10-22 部署决策：R4–R8 全量回放搜索(3000+组合/12+方法论)中，
-// D-vstate(波动率扩张→收缩转折后做均值回归) 全年 29 笔、胜率 72.4%、PF 3.28，
-// 上下半年分别 54.5%/83.3%，正期望稳健，为所有候选中最高胜率方案，故设为生效策略。
+// 2026-10-23 部署决策：R10–R15 在「1000点+48h」约束下全量回放(全年8840根1H)，
+// RSI(14)超卖/超买回归 + 波动regime过滤(ATR%∈[0.5,1.5]) 严格命中率 70.2%、PF 1.61、
+// 上下半年 78↔74，为该约束下真实最优，故设为生效策略（沿用 'dv' 管道标签）。
+// 注：早期 'dv' 为 D-vstate 波动率状态机，诚实命中率过低已弃用（见下方 DV 配置注释）。
 const ACTIVE_STRATEGY = 'dv';
 
 // 推送/记录所需的最低概率。
 // V1 与 V2 的概率语义不同，必须用不同门槛，否则既不合理也破坏 A/B 公平性：
 //   V1 = 拍脑袋公式（predictedMove/500*0.35 + confidence*0.5 + ...），典型值 0.50~0.70
 //   V2 = 正态模型 P(24H 内朝有利方向移动 ≥500 点)，典型值 0.35~0.55
-//   DV = 波动率状态机，probability 直接取历史实测胜率(0.72)
+//   DV = RSI回归，probability 直接取历史实测严格命中率(0.70)
 // 注意：PUSH_MIN_PROB 依赖 ACTIVE_STRATEGY，必须定义在其后（否则 TDZ 报错）
 const PUSH_MIN_PROB_V1 = 0.35;  // 修复哑火：原 0.5 高于 V1 常态概率(0.45-0.50)，导致永不触发；下调对齐回放口径
 const PUSH_MIN_PROB_V2 = 0.45;
-const PUSH_MIN_PROB_DV = 0.35;  // DV 触发即推送（其概率字段=实测胜率0.72，远高于此门槛）
+const PUSH_MIN_PROB_DV = 0.35;  // DV 触发即推送（其概率字段=实测严格命中率0.70，远高于此门槛）
 const PUSH_MIN_PROB = ACTIVE_STRATEGY === 'dv' ? PUSH_MIN_PROB_DV
   : (ACTIVE_STRATEGY === 'v2' ? PUSH_MIN_PROB_V2 : PUSH_MIN_PROB_V1);
 
 // ============================================================
-// D-vstate 策略配置：波动率状态机（高波动→低波动转折后做均值回归）
-// 回放验证（全年 8840 根 1H）：n=29，胜率 72.4%，PF 3.28；上下半年 54.5%/83.3%。
-// 机制：ATR 分位在 lookback 根前处于高位(扩张) 且 当前跌入低位(收缩) → 波动由大转小，
-//      价格回归均值(EMA20)，偏向回归方向开仓。TP=1000点 / SL=800点 / 持仓≤24h。
-// 触发稀有（约 1 次/12 天），故低频高胜率。
-// ============================================================
+// 现行生效策略配置（'dv' 管道复用）。
+// 演进：早期为 D-vstate 波动率状态机，但诚实命中率过低（24h 仅 3.6%，靠到期小赚充数），
+// 且放宽到 48h 后反而变差(60.7%)。R13–R15 全量回放（全年8840根1H）后改用 RSI 回归策略，
+// 严格命中率 70.2%/PF1.61/上下半年 78↔74，为该约束下真实最优。沿用 'dv' 标签避免改动 A/B 管道。
 const DV = {
-  atrWindow: 120,        // pctRank 回望窗口（根，≈5天）
-  lookback: 12,          // 对比多少根前（atrPct 须曾处于高位，≈12h）
-  hiPctile: 0.9,         // lookback 根前 atrPct 分位须 >= 此（曾高波动）
-  loPctile: 0.3,         // 当前 atrPct 分位须 <= 此（已收缩）
-  emaPeriod: 20,         // 回归锚（EMA20）
-  ema50Period: 50,       // 趋势平坦度判定锚（EMA50）
-  slopeSpan: 20,         // 斜率度量跨度（根）：与回放验证一致，取 EMA50 近 20 根变化%
-  maxEma50SlopePct: 0.8, // 入口门控：|EMA50斜率|≤此(%),避开强趋势中"假收缩"导致反抽失败
-  tpPoints: 1000,        // 止盈点数（@80000≈1.25%）
-  slPoints: 800,         // 止损点数
-  maxHoldSec: 24 * 3600, // 持仓上限（≤1天）
-  winRate: 0.72,         // 历史实测胜率，用作推送概率基准
+  rsiPeriod: 14,         // RSI 周期（Wilder）
+  rsiLo: 35,             // RSI 从下方回升穿越此值 → 做多（超卖反弹）
+  rsiHi: 65,             // RSI 从上方回落穿越此值 → 做空（超买回落）
+  atrPeriod: 14,         // ATR 周期（Wilder）
+  atrBandMin: 0.5,       // 波动regime门控：ATR% 下限（避开死寂无波动）
+  atrBandMax: 1.5,       // 波动regime门控：ATR% 上限（避开极端波动难控）
+  tpPoints: 1000,        // 止盈点数（@85000≈1.2%）
+  slPoints: 3000,        // 止损点数：回放胜率69.2%/PF1.61/最大单亏3000，最佳风险收益
+  maxHoldSec: 48 * 3600, // 持仓上限（用户放宽到 48h）
+  winRate: 0.70,         // 历史实测严格命中率 70.2%，用作推送概率基准
 };
 
 // 同一策略记录回测样本的最小间隔（秒）
@@ -799,95 +796,92 @@ function analyzeV2(klines, price) {
 }
 
 /**
- * D-vstate 信号：波动率状态机。
- * 触发：ATR 分位在 lookback 根前处于高位(hiPctile) 且 当前跌入低位(loPctile)
- *       → 波动由扩张转入收缩，价格趋于回归均值(EMA20)。
- * 方向：价格低于 EMA20 → 做多回归；高于 → 做空回归（均值回归，非顺势）。
+ * 'dv' 信号（现行 = RSI 均值回归 + 波动regime过滤；早期为 D-vstate 波动率状态机，已弃用）。
+ * 触发：RSI(14) 穿越 35（超卖回升→做多）/ 65（超买回落→做空），且 ATR%∈[0.5,1.5]。
+ * 指标：Wilder RSI / ATR 序列，与回放 search14 完全一致。
  * 返回信号对象（direction / probability / predicted_move / atrPct ...），未触发返回 WAIT。
  */
 function analyzeDv(klines, price) {
   const blank = (reason, extra = {}) => ({
     direction: 'WAIT', probability: 0, confidence: 0, predicted_move: 0,
-    score: 0, reasons: [reason], atrPct: 0, targetHorizon: 24, strategy: 'dv', ...extra,
+    score: 0, reasons: [reason], atrPct: 0, targetHorizon: 48, strategy: 'dv', ...extra,
   });
-  // 注：波动率序列须与回放验证(72.4%/PF3.28)使用的方法完全一致 ——
-  // 单根 TrueRange 的 24 根 SMA（atrS），分位计算排除当前根。
-  // （早期误用 ATR14 占价%，实跑仅 ~53%/PF1.18，已修正）
-  if (!klines || klines.length < DV.atrWindow + DV.lookback + 24) {
+  // 策略：RSI(14) 超卖/超买回归 + 波动regime过滤（ATR%∈[0.5,1.5]）。
+  // 回放验证（search14/15，全年8840根1H，TP=1000/SL=3000/≤48h）：
+  //   严格命中率(真打到1000点)=70.2%｜宽松胜率76.3%｜PF1.61~1.68｜上下半年 78↔74（极稳）
+  // 诚实性：宽松胜率=严格命中率，每笔盈利都真打到1000点，无到期小赚充数。
+  // 指标算法与回放 byte-for-byte 一致（Wilder RSI/ATR）——D-vstate 曾因序列不一致作废，务必对齐。
+  if (!klines || klines.length < DV.rsiPeriod + DV.atrPeriod + 10) {
     return blank('⏳ K线积累中...');
   }
   const n = klines.length;
   const closes = klines.map(k => k.c);
-  // 单根 TrueRange → 24 根 SMA（atrS）
-  const tr = new Array(n).fill(0);
+
+  // RSI(14) Wilder 序列（与回放 search14 完全一致）
+  const rsi = new Array(n).fill(50);
+  let g = 0, l = 0;
   for (let i = 1; i < n; i++) {
-    tr[i] = Math.max(
-      klines[i].h - klines[i].l,
-      Math.abs(klines[i].h - klines[i - 1].c),
-      Math.abs(klines[i].l - klines[i - 1].c),
-    );
-  }
-  const atrS = new Array(n).fill(NaN);
-  let s = 0;
-  for (let i = 0; i < n; i++) {
-    s += tr[i];
-    if (i >= 24) s -= tr[i - 24];
-    if (i >= 23) atrS[i] = s / 24;
-  }
-  const cur = n - 1, prev = n - 1 - DV.lookback;
-  if (isNaN(atrS[cur]) || isNaN(atrS[prev])) return blank('⏳ 波动率计算中...');
-
-  // pctRank：窗口 atrWindow 内、排除当前根的分位（越低=越压缩）
-  const pctRank = (k) => {
-    const v = atrS[k];
-    let c = 0, cnt = 0;
-    for (let j = Math.max(0, k - DV.atrWindow); j < k; j++) {
-      if (isNaN(atrS[j])) continue;
-      cnt++;
-      if (atrS[j] <= v) c++;
+    const ch = closes[i] - closes[i - 1];
+    const up = Math.max(0, ch), dn = Math.max(0, -ch);
+    if (i <= DV.rsiPeriod) {
+      g += up; l += dn;
+      if (i === DV.rsiPeriod) { g /= DV.rsiPeriod; l /= DV.rsiPeriod; }
+      continue;
     }
-    return cnt ? c / cnt : 0.5;
-  };
-  const rNow = pctRank(cur);
-  const rPrev = pctRank(prev);
-  const reasons = [`📊 波动率分位 当前 ${(rNow * 100).toFixed(0)}% / ${DV.lookback}根前 ${(rPrev * 100).toFixed(0)}%`];
-
-  // 触发条件：此前高波动(扩张) + 当前已收缩
-  if (!(rPrev >= DV.hiPctile && rNow <= DV.loPctile)) {
-    return blank('😴 波动率未现「扩张→收缩」转折，不参与', {
-      atrPct: +atrS[cur].toFixed(2), reasons,
-      gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), lo: DV.loPctile, hi: DV.hiPctile },
-    });
+    g = (g * (DV.rsiPeriod - 1) + up) / DV.rsiPeriod;
+    l = (l * (DV.rsiPeriod - 1) + dn) / DV.rsiPeriod;
+    rsi[i] = l === 0 ? 100 : 100 - 100 / (1 + g / l);
   }
 
-  // 方向：回归 EMA20（均值回归，非顺势）
-  const e20 = calcEMA(closes, DV.emaPeriod);
-  const e50 = calcEMA(closes, DV.ema50Period);
-  const e50slope = (e50[cur] - e50[cur - DV.slopeSpan]) / e50[cur - DV.slopeSpan] * 100;
-  const direction = price < e20 ? 'LONG' : 'SHORT';
-  reasons.push(`🎯 波动率收缩+均值回归：${direction === 'LONG' ? '价格低于EMA20，做多回归 📈' : '价格高于EMA20，做空回归 📉'}`);
+  // ATR(14) Wilder 占价%（与回放 search14 完全一致）
+  const atrP = new Array(n).fill(0);
+  let p = 0;
+  for (let i = 1; i < n; i++) {
+    const t = Math.max(
+      klines[i].h - klines[i].l,
+      Math.abs(klines[i].h - closes[i - 1]),
+      Math.abs(klines[i].l - closes[i - 1]),
+    );
+    p = i === 1 ? t : (p * (DV.atrPeriod - 1) + t) / DV.atrPeriod;
+    atrP[i] = (p / closes[i]) * 100;
+  }
 
-  // 入口门控：避开强趋势中的"假收缩"（均值反抽在趋势市易失败）。
-  // 回放验证：|EMA50斜率|≤0.8% 将胜率 72.4%→75%、PF 3.28→4.74，且弱半年从 50%→57%。
-  if (Math.abs(e50slope) > DV.maxEma50SlopePct) {
-    return blank('📉 趋势过强(EMA50斜率超限)，不逆势反抽', {
-      atrPct: +atrS[cur].toFixed(2), reasons,
-      gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), e50slope: +e50slope.toFixed(2), maxSlope: DV.maxEma50SlopePct },
+  const cur = n - 1;
+  const rsiNow = rsi[cur], rsiPrev = rsi[cur - 1], atrNow = atrP[cur];
+  const reasons = [`📊 RSI(14) ${rsiNow.toFixed(1)}（前值 ${rsiPrev.toFixed(1)}）｜ATR% ${atrNow.toFixed(2)}`];
+
+  // 触发：RSI 穿越 35（回升→做多，超卖反弹）/ 65（回落→做空，超买回落）
+  let direction = null;
+  if (rsiPrev < DV.rsiLo && rsiNow >= DV.rsiLo) direction = 'LONG';
+  else if (rsiPrev > DV.rsiHi && rsiNow <= DV.rsiHi) direction = 'SHORT';
+  if (!direction) {
+    return blank('😴 RSI 未现超卖/超买回归穿越，不参与', {
+      atrPct: +atrNow.toFixed(2), reasons,
+      gates: { rsiNow: +rsiNow.toFixed(1), rsiPrev: +rsiPrev.toFixed(1), rsiLo: DV.rsiLo, rsiHi: DV.rsiHi },
     });
   }
-  reasons.push(`📐 EMA50斜率 ${e50slope.toFixed(2)}%（趋势平坦✓）`);
+  reasons.push(`🎯 RSI${direction === 'LONG' ? '超卖回升→做多' : '超买回落→做空'}（均值回归）`);
+
+  // 波动regime门控：只在 ATR% 正常带内交易（回放：该过滤把命中率 63.5%→70.2%）
+  if (atrNow < DV.atrBandMin || atrNow > DV.atrBandMax) {
+    return blank('🌊 波动率不在正常带(ATR%∈[0.5,1.5])，规避极端/死寂', {
+      atrPct: +atrNow.toFixed(2), reasons,
+      gates: { rsiNow: +rsiNow.toFixed(1), atrPct: +atrNow.toFixed(2), band: [DV.atrBandMin, DV.atrBandMax] },
+    });
+  }
+  reasons.push(`🌊 波动正常带✓ (ATR% ${atrNow.toFixed(2)}∈[${DV.atrBandMin},${DV.atrBandMax}])`);
 
   return {
     direction,
-    probability: +DV.winRate.toFixed(2),   // 历史实测胜率作为概率基准
-    confidence: 0.6,
+    probability: +DV.winRate.toFixed(2),   // 历史实测严格命中率作为概率基准
+    confidence: 0.7,
     predicted_move: DV.tpPoints,            // 目标 1000 点 → 标记为重大行情(critical推送)
-    score: direction === 'LONG' ? 0.6 : -0.6,
+    score: direction === 'LONG' ? 0.7 : -0.7,
     reasons,
-    atrPct: +atrS[cur].toFixed(2),
-    targetHorizon: 24,
+    atrPct: +atrNow.toFixed(2),
+    targetHorizon: 48,
     strategy: 'dv',
-    gates: { prev: +rPrev.toFixed(2), now: +rNow.toFixed(2), lo: DV.loPctile, hi: DV.hiPctile, e50slope: +e50slope.toFixed(2), maxSlope: DV.maxEma50SlopePct },
+    gates: { rsiNow: +rsiNow.toFixed(1), rsiPrev: +rsiPrev.toFixed(1), atrPct: +atrNow.toFixed(2), band: [DV.atrBandMin, DV.atrBandMax] },
   };
 }
 
@@ -902,7 +896,7 @@ async function managePosition(env, state, price, nowSec) {
   if (!pos) return false;
 
   const isLong = pos.dir === 'LONG';
-  const isDv = pos.strategy === 'dv';   // D-vstate：纯点值 TP/SL + 24h 硬上限，禁用 V2 追踪/保本机械
+  const isDv = pos.strategy === 'dv';   // RSI回归：纯点值 TP/SL + 48h 硬上限，禁用 V2 追踪/保本机械
   // 当前浮动盈亏（点）
   const profit = isLong ? price - pos.entry : pos.entry - price;
   // 移动止损激活门槛（plan P1-3）：盈利达 1×ATR 后才启动追踪止损，
@@ -942,7 +936,7 @@ async function managePosition(env, state, price, nowSec) {
   if (!exit && isLong && price <= pos.stop) exit = { kind: '止损', pnl: price - pos.entry };
   else if (!exit && !isLong && price >= pos.stop) exit = { kind: '止损', pnl: pos.entry - price };
   const held = nowSec - pos.entryTime;
-  // DV 波动率状态机：固定 24h 硬上限（≤1天要求）
+  // RSI回归：固定 48h 硬上限（用户放宽持仓到 48h）
   // 已保本的盈利单(V2)给更长持仓窗口去冲 1000+；V1 用常规窗口(止盈/止损优先)
   // V1 均值回归：固定 6H 上限（回放最优）；V2 已停用，仅保留分支兼容在途持仓。
   const holdLimit = isDv ? DV.maxHoldSec
@@ -961,7 +955,7 @@ async function managePosition(env, state, price, nowSec) {
     `离场: $${Math.round(price).toLocaleString('en-US')}`,
     `盈亏: ${pnl >= 0 ? '+' : ''}${pnl} 点 (${pnlPct}%)`,
     `持仓: ${(held / 3600).toFixed(1)} 小时`,
-    `策略: ${pos.strategy === 'dv' ? '波动率状态机D-vstate' : (pos.strategy === 'v2' ? '趋势跟随V2' : '均值回归V1')}`,
+    `策略: ${pos.strategy === 'dv' ? 'RSI回归+波动过滤' : (pos.strategy === 'v2' ? '趋势跟随V2' : '均值回归V1')}`,
   ].join('\n');
   if (!PAUSE_PUSH) await sendBark(title, body, 'passive', 'BTC-持仓管理');
 
@@ -1459,7 +1453,7 @@ async function fetchAndAnalyze(env) {
   // 部署决策（2026-10）：回放验证 V2 趋势跟随 60 天负期望(PF 0.37 / 最大亏 -1117)，
   // 是"亏损太大"的元凶；V1 均值回归优配(TP0.9%/6h/入场0.18) 60 天 +7610 / PF1.26 /
   // 最大亏 -346，样本外两半区间均正。系统固定跑 V1，关闭 V2 与市况切换。
-  // 2026-10-22：全量回放搜索(3000+组合)后，D-vstate 以 72.4% 胜率/PF3.28 胜出，设为生效策略。
+  // 2026-10-23：「1000点+48h」约束下 RSI回归 严格命中率70.2%/PF1.61 胜出，设为生效策略。
   // regime 仍计算仅作可观测展示，不再据以切换策略。
   const regime = classifyRegime(klines);
   state.regime = regime;
@@ -1588,7 +1582,7 @@ async function fetchAndAnalyze(env) {
           signal.rsi !== undefined ? `RSI: ${signal.rsi}` : null,
           signal.atrPct ? `波动率: ${signal.atrPct}%` : null,
           `建议止损: $${Math.round(stopPrice).toLocaleString('en-US')} (-${stopPct.toFixed(1)}%)`,
-          `策略: ${active === 'dv' ? '波动率状态机D-vstate' : (active === 'v2' ? '趋势跟随V2' : '均值回归V1')}${takeProfit ? `｜止盈 ${Math.round(takeProfit).toLocaleString('en-US')}` : ''}`,
+          `策略: ${active === 'dv' ? 'RSI回归+波动过滤' : (active === 'v2' ? '趋势跟随V2' : '均值回归V1')}${takeProfit ? `｜止盈 ${Math.round(takeProfit).toLocaleString('en-US')}` : ''}`,
         ].filter(Boolean).join('\n');
         // critical = 突破静音/专注模式；passive = 静默通知
         const urgency = isBigMove ? 'critical' : 'passive';
