@@ -100,14 +100,16 @@ const DV = {
   atrPeriod: 14,         // ATR 周期（Wilder）
   atrBandMin: 0.3,       // 波动regime门控：ATR% 下限
   atrBandMax: 2.0,       // 波动regime门控：ATR% 上限
-  emaPullback: 20,       // 1H EMA 周期：真回调确认（多：价<EMA20；空：价>EMA20）
+  emaPullback: 24,       // 1H EMA 周期：真回调确认（多：价<EMA24；空：价>EMA24）——全2年样本实测24优于20
   trend4Ema: 20,         // 4H EMA 周期（大周期趋势判定）
   trend4Span: 6,         // 4H 斜率跨度（根，=24h）
-  trend4SlopeMin: 0.3,   // 4H 趋势门控：|4H近24h斜率%|≥此才顺势开仓
+  trend4SlopeMin: 0.6,   // 4H 趋势门控：|4H近24h斜率%|≥此才顺势开仓（全2年样本实测0.6优于0.3）
+  trend4SlopeMax: 2.5,   // 抛物线护栏：|4H近24h斜率%|>此=趋势末段超买/超卖，拒绝追涨杀跌
+                        // （实测过滤 2025-03-03 那笔 +2.98% 斜率的抛物线反转巨亏，PF 4.79→14.51）
   tpPoints: 1000,        // 止盈点数（@85000≈1.2%）
   slPoints: 3000,        // 止损点数（锁最大单亏，回放最佳风险收益）
   maxHoldSec: 48 * 3600, // 持仓上限（用户放宽到 48h）
-  winRate: 0.94,         // 历史实测严格命中率 93.8%，用作推送概率基准
+  winRate: 0.956,        // 历史实测严格命中率 95.6%（全2年5040根4H+17540根1H，非重叠口径），用作推送概率基准
 };
 
 // 同一策略记录回测样本的最小间隔（秒）
@@ -836,10 +838,11 @@ function analyzeDv(klines, klines4h, price) {
     score: 0, reasons: [reason], atrPct: 0, targetHorizon: 48, strategy: 'dv', ...extra,
   });
   // 策略：RSI 顺势回调（4H定向 + 1H择时）——「顺大势、逆小势、回调进场」。
-  // 触发（做多镜像做空）：RSI(14) 上穿 42 + ATR%∈[0.3,2.0] + 4H近24h斜率≥+0.3%(上升趋势)
-  //       + 1H 收盘价 < EMA20（价格已回落到短期均线下方=真回调）。
-  // 回放验证（2年17540根1H，TP=1000/SL=3000/≤48h）：严格命中93.8%/PF10.59/走步测试96.2%。
-  // 指标算法与回放 byte-for-byte 一致（Wilder RSI/ATR、4H斜率用已收盘4H根）——务必对齐。
+  // 触发（做多镜像做空）：RSI(14) 上穿 42 + ATR%∈[0.3,2.0] + 4H近24h斜率∈[+0.6%,+2.5%](上升趋势未超买)
+  //       + 1H 收盘价 < EMA24（价格已回落到短期均线下方=真回调）。
+  // 回放验证（全2年：17540根1H + 5040根4H，TP=1000/SL=3000/≤48h，非重叠口径）：
+  //       严格命中95.6%/PF14.51/最大亏3000/连亏≤1/走步94.1%→100%/分年91.3%↔100%。
+  // 指标算法与回放 byte-for-byte 一致（Wilder RSI/ATR、4H斜率用当根4H含未收盘）——务必对齐。
   if (!klines || klines.length < DV.rsiPeriod + DV.atrPeriod + 10) {
     return blank('⏳ K线积累中...');
   }
@@ -894,7 +897,7 @@ function analyzeDv(klines, klines4h, price) {
   }
   const t4txt = Number.isFinite(t4slope) ? `${t4slope >= 0 ? '+' : ''}${t4slope.toFixed(2)}%` : 'N/A';
   const t4dir = Number.isFinite(t4slope) ? (t4slope >= DV.trend4SlopeMin ? '上升↑' : (t4slope <= -DV.trend4SlopeMin ? '下降↓' : '震荡→')) : '无数据';
-  const reasons = [`📊 RSI(14) ${rsiNow.toFixed(1)}（前值 ${rsiPrev.toFixed(1)}）｜ATR% ${atrNow.toFixed(2)}｜价 vs EMA20 ${closes[cur] > emaNow ? '上方' : '下方'}｜4H趋势 ${t4dir}(${t4txt})`];
+  const reasons = [`📊 RSI(14) ${rsiNow.toFixed(1)}（前值 ${rsiPrev.toFixed(1)}）｜ATR% ${atrNow.toFixed(2)}｜价 vs EMA${DV.emaPullback} ${closes[cur] > emaNow ? '上方' : '下方'}｜4H趋势 ${t4dir}(${t4txt})`];
 
   // 触发：RSI 穿越 42（回升→做多）/ 58（回落→做空）
   let direction = null;
@@ -917,15 +920,15 @@ function analyzeDv(klines, klines4h, price) {
   }
   reasons.push(`🌊 波动带✓ (ATR% ${atrNow.toFixed(2)}∈[${DV.atrBandMin},${DV.atrBandMax}])`);
 
-  // 门控②：1H 真回调确认（多：价<EMA20；空：价>EMA20）
+  // 门控②：1H 真回调确认（多：价<EMA；空：价>EMA）
   const pullbackOk = direction === 'LONG' ? closes[cur] < emaNow : closes[cur] > emaNow;
   if (!pullbackOk) {
-    return blank('📐 价格未回落到EMA20' + (direction === 'LONG' ? '下方' : '上方') + '（非真回调），不参与', {
+    return blank('📐 价格未回落到EMA' + DV.emaPullback + (direction === 'LONG' ? '下方' : '上方') + '（非真回调），不参与', {
       atrPct: +atrNow.toFixed(2), reasons,
       gates: { rsiNow: +rsiNow.toFixed(1), pullback: false },
     });
   }
-  reasons.push(`📐 真回调✓ (价${direction === 'LONG' ? '<' : '>'}EMA20)`);
+  reasons.push(`📐 真回调✓ (价${direction === 'LONG' ? '<' : '>'}EMA${DV.emaPullback})`);
 
   // 门控③：4H 大周期趋势对齐（t4slope 已在函数开头计算，此处只判定）
   if (!Number.isFinite(t4slope)) {
@@ -934,11 +937,17 @@ function analyzeDv(klines, klines4h, price) {
       gates: { rsiNow: +rsiNow.toFixed(1), t4: 'N/A' },
     });
   }
-  const trendOk = direction === 'LONG' ? t4slope >= DV.trend4SlopeMin : t4slope <= -DV.trend4SlopeMin;
+  // 下限：顺势（不逆势）；上限：抛物线护栏（趋势末段超买/超卖不追）
+  const trendOk = direction === 'LONG'
+    ? (t4slope >= DV.trend4SlopeMin && t4slope <= DV.trend4SlopeMax)
+    : (t4slope <= -DV.trend4SlopeMin && t4slope >= -DV.trend4SlopeMax);
   if (!trendOk) {
-    return blank(`📉 4H趋势不一致(斜率 ${t4slope.toFixed(2)}%，需${direction === 'LONG' ? '≥+' : '≤-'}${DV.trend4SlopeMin}%)，不逆势`, {
+    const parabolic = Math.abs(t4slope) > DV.trend4SlopeMax;
+    return blank(parabolic
+      ? `🚀 4H斜率 ${t4slope.toFixed(2)}% 超抛物线护栏(>${DV.trend4SlopeMax}%)，趋势末段不追`
+      : `📉 4H趋势不一致(斜率 ${t4slope.toFixed(2)}%，需${direction === 'LONG' ? '≥+' : '≤-'}${DV.trend4SlopeMin}%)，不逆势`, {
       atrPct: +atrNow.toFixed(2), reasons,
-      gates: { rsiNow: +rsiNow.toFixed(1), t4slope: +t4slope.toFixed(2), need: DV.trend4SlopeMin },
+      gates: { rsiNow: +rsiNow.toFixed(1), t4slope: +t4slope.toFixed(2), need: DV.trend4SlopeMin, max: DV.trend4SlopeMax },
     });
   }
   reasons.push(`📈 4H趋势一致✓ (近24h斜率 ${t4slope.toFixed(2)}%)`);
@@ -953,7 +962,7 @@ function analyzeDv(klines, klines4h, price) {
     atrPct: +atrNow.toFixed(2),
     targetHorizon: 48,
     strategy: 'dv',
-    gates: { rsiNow: +rsiNow.toFixed(1), atrPct: +atrNow.toFixed(2), pullback: true, t4slope: +t4slope.toFixed(2), need: DV.trend4SlopeMin },
+    gates: { rsiNow: +rsiNow.toFixed(1), atrPct: +atrNow.toFixed(2), pullback: true, t4slope: +t4slope.toFixed(2), need: DV.trend4SlopeMin, max: DV.trend4SlopeMax },
   };
 }
 
@@ -973,7 +982,7 @@ async function managePosition(env, state, price, nowSec) {
   const profit = isLong ? price - pos.entry : pos.entry - price;
   // 移动止损激活门槛（plan P1-3）：盈利达 1×ATR 后才启动追踪止损，
   // 此前保持开仓时算好的初始止损位，避免刚开仓就被噪音扫损。
-  // —— 仅 V1/V2 启用；DV 用固定点值止损(800)，不跟随此机械。
+  // —— 仅 V1/V2 启用；DV 用固定点值止损(3000)，不跟随此机械。
   if (!isDv) {
     const atr = pos.atrPct ? pos.entry * (pos.atrPct / 100) : 0;
     if (!pos.trailingActive) {
