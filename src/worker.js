@@ -1051,7 +1051,7 @@ async function managePosition(env, state, price, nowSec) {
       rec.realizedKind = exit.kind; // 止损 / 到期
       rec.realizedAt = nowSec;
       rec.done = true;
-      await saveBacktest(env, records);
+      await saveBacktest(env, records, true);   // 离场写回=事件，立即落盘
     }
   } catch (e) {
     console.error('写回实际盈亏失败:', e);
@@ -1110,8 +1110,20 @@ async function getState(env) {
   return raw;
 }
 
-async function saveState(env, state) {
-  await env.BTC_STATE.put('current', JSON.stringify(state));
+async function saveState(env, state, force = false) {
+  // KV 免费版限额：每天 1000 次写入。cron 每分钟跑一次，若每次全量落盘=1440+次/天，
+  // 超额后 put() 抛错会中断整条处理链（曾导致 /api/state 500、信号被静默吞掉）。
+  // 对策：① 落盘节流到 5 分钟一次（≈288次/天，h24 本来就是 5 分钟采样，不丢数据）；
+  //       ② 信号/开仓/离场等事件 force=true 立即落盘；
+  //       ③ 写入失败只记日志不抛出——交易与推送绝不能因 KV 限额而停摆。
+  const now = Date.now();
+  if (!force && now - (state._lastSaveMs || 0) < SAVE_INTERVAL_MS) return;
+  try {
+    state._lastSaveMs = now;
+    await env.BTC_STATE.put('current', JSON.stringify(state));
+  } catch (e) {
+    console.error('状态保存失败(不致命，不影响交易):', e && e.message || e);
+  }
 }
 
 // ============================================================
@@ -1123,39 +1135,54 @@ async function saveState(env, state) {
 const BT_KEY = 'backtest';
 const BT_MAX = 500;              // 最多保留记录数
 const H1 = 3600, H6 = 21600, H24 = 86400;
+const SAVE_INTERVAL_MS = 5 * 60 * 1000;  // KV 落盘节流：5 分钟（防击穿免费版 1000 次/天限额）
+let lastBtSaveMs = 0;            // 回测记录落盘节流标记（模块级，isolate 热复用期间有效）
 
 async function getBacktest(env) {
   const raw = await env.BTC_STATE.get(BT_KEY, 'json');
   return (raw && Array.isArray(raw.records)) ? raw.records : [];
 }
 
-async function saveBacktest(env, records) {
-  await env.BTC_STATE.put(BT_KEY, JSON.stringify({ records }));
+async function saveBacktest(env, records, force = false) {
+  // 同 saveState：节流 + 容错。force=true 用于新信号/离场写回等事件
+  const now = Date.now();
+  if (!force && now - lastBtSaveMs < SAVE_INTERVAL_MS) return;
+  try {
+    await env.BTC_STATE.put(BT_KEY, JSON.stringify({ records }));
+    lastBtSaveMs = now;
+  } catch (e) {
+    console.error('回测记录保存失败(不致命，不影响交易):', e && e.message || e);
+  }
 }
 
 // 新增一条待验证信号
 // 除终点价格外，同步记录窗口内的最高/最低价，用于计算 MFE/MAE
 async function recordSignal(env, signal, price, nowMs, strategy = 'v1', stopPct = null) {
-  const records = await getBacktest(env);
-  records.push({
-    id: nowMs,
-    strategy,                       // v1=均值回归(现行) / v2=趋势跟随(候选)
-    time: nowMs / 1000,
-    direction: signal.direction,
-    price: price,
-    probability: signal.probability,
-    predicted_move: signal.predicted_move,
-    stopPct,                       // 开仓时 ATR 止损幅度(%)：战绩计入止损用
-    // 终点价格
-    h1: null, h6: null, h24: null,
-    // 窗口内极值（用于算 MFE/MAE，衡量真实可捕捉的盈利空间）
-    h1_hi: price, h1_lo: price,
-    h6_hi: price, h6_lo: price,
-    h24_hi: price, h24_lo: price,
-    done: false,
-  });
-  if (records.length > BT_MAX) records.splice(0, records.length - BT_MAX);
-  await saveBacktest(env, records);
+  // 统计记录绝不能再挡住交易主链路（KV 限额期间曾因它抛异常吞掉真信号）——全流程容错
+  try {
+    const records = await getBacktest(env);
+    records.push({
+      id: nowMs,
+      strategy,                       // v1=均值回归(现行) / v2=趋势跟随(候选)
+      time: nowMs / 1000,
+      direction: signal.direction,
+      price: price,
+      probability: signal.probability,
+      predicted_move: signal.predicted_move,
+      stopPct,                       // 开仓时 ATR 止损幅度(%)：战绩计入止损用
+      // 终点价格
+      h1: null, h6: null, h24: null,
+      // 窗口内极值（用于算 MFE/MAE，衡量真实可捕捉的盈利空间）
+      h1_hi: price, h1_lo: price,
+      h6_hi: price, h6_lo: price,
+      h24_hi: price, h24_lo: price,
+      done: false,
+    });
+    if (records.length > BT_MAX) records.splice(0, records.length - BT_MAX);
+    await saveBacktest(env, records, true);   // 新信号=事件，立即落盘
+  } catch (e) {
+    console.error('信号记录失败(不致命，不影响推送):', e && e.message || e);
+  }
 }
 
 // 每次运行时更新：窗口内持续刷新增量极值，窗口到期时锁定终点价格
@@ -1579,35 +1606,12 @@ async function fetchAndAnalyze(env) {
   const nowSec = now / 1000;
 
   // plan A ①③：先处理已有持仓的止损 / 移动止损 / 到期离场（每周期必跑，与记录/推送解耦）
-  await managePosition(env, state, newPrice, nowSec);
-
-  // ---- A/B 样本记录：三策略各自独立记录，用实盘表现对比 ----
-  // 间隔 30 分钟而非 5 分钟：相邻信号高度重叠不构成独立样本，
-  // 拉长间隔可提升统计显著性，同时避免 KV 记录数暴涨
-  for (const [tag, sig] of [['v1', signalV1], ['v2', signalV2], ['dv', signalDv]]) {
-    if (!sig || sig.direction === 'WAIT') continue;
-    const minProb = tag === 'v2' ? PUSH_MIN_PROB_V2
-      : (tag === 'dv' ? PUSH_MIN_PROB_DV : PUSH_MIN_PROB_V1);
-    if ((sig.probability || 0) < minProb) continue;
-    const lastKey = `last_bt_${tag}`;
-    const lastDirKey = `last_bt_dir_${tag}`;
-    // 方向延续 = 同一波行情的重复采样，用更长的间隔；方向刚变 = 新信号，立刻记
-    const sameDir = state[lastDirKey] === sig.direction;
-    const interval = sameDir ? BT_SEGMENT_INTERVAL : BT_RECORD_INTERVAL;
-    if (nowSec - (state[lastKey] || 0) < interval) continue;
-    state[lastKey] = nowSec;
-    state[lastDirKey] = sig.direction;
-    // V2 记录 ATR 止损幅度；DV 记录固定点值止损幅度(800点→百分比)，供回测止损记账
-    let stopPct = null;
-    if (tag === 'v2' && sig.atrPct) {
-      stopPct = Math.min(V2_STOP_MAX_PCT, Math.max(V2_STOP_MIN_PCT, sig.atrPct * V2_STOP_MULT));
-    } else if (tag === 'dv' && sig.atrPct) {
-      stopPct = (DV.slPoints / newPrice) * 100;
-    }
-    await recordSignal(env, sig, newPrice, now, tag, stopPct);
-  }
+  const exited = await managePosition(env, state, newPrice, nowSec);
+  let stateDirty = !!exited;   // 持仓离场=事件，需立即落盘
 
   // ---- 推送：只用 ACTIVE_STRATEGY 指定的那个 ----
+  // 【顺序即生命线】推送/开仓必须排在 A/B 记录之前：KV 写入限额耗尽时 recordSignal 会抛错，
+  // 若排在前面就会中断整条处理链，把真信号静默吞掉（2026-11 实际发生过 10 天无信号+面板500）。
   // 非重叠持仓（plan A ①）：已有持仓时不再开新仓，直到 managePosition 离场清空。
   // 这是「一波行情只开一次仓、持满 24H」的实盘实现，对应回测口径 B 盈亏比 1.06→2.73。
   // 共振过滤（plan P1-4，默认关）：要求 V1/V2 同向才交易，进一步降频
@@ -1625,6 +1629,7 @@ async function fetchAndAnalyze(env) {
         confidence: signal.confidence,
         strategy: active,
       });
+      stateDirty = true;   // 新信号段入历史=事件
       if (state.history.length > 100) state.history.shift();
 
       // 分级推送：
@@ -1683,6 +1688,7 @@ async function fetchAndAnalyze(env) {
         await sendBark(title, body, urgency, group);
         state.last_signal_time = nowSec;
         state.last_signal_dir = signal.direction;
+        stateDirty = true;   // 开仓=事件，立即落盘（防 KV 限额期丢持仓）
         // 登记持仓：非重叠 + 移动止损的生命周期从这里开始
         state.open_pos = {
           dir: signal.direction,
@@ -1701,10 +1707,37 @@ async function fetchAndAnalyze(env) {
     }
   }
 
+  // ---- A/B 样本记录：三策略各自独立记录，用实盘表现对比 ----
+  // （排在推送之后：统计是旁路，绝不能再挡住交易主链路）
+  // 间隔 30 分钟而非 5 分钟：相邻信号高度重叠不构成独立样本，
+  // 拉长间隔可提升统计显著性，同时避免 KV 记录数暴涨
+  for (const [tag, sig] of [['v1', signalV1], ['v2', signalV2], ['dv', signalDv]]) {
+    if (!sig || sig.direction === 'WAIT') continue;
+    const minProb = tag === 'v2' ? PUSH_MIN_PROB_V2
+      : (tag === 'dv' ? PUSH_MIN_PROB_DV : PUSH_MIN_PROB_V1);
+    if ((sig.probability || 0) < minProb) continue;
+    const lastKey = `last_bt_${tag}`;
+    const lastDirKey = `last_bt_dir_${tag}`;
+    // 方向延续 = 同一波行情的重复采样，用更长的间隔；方向刚变 = 新信号，立刻记
+    const sameDir = state[lastDirKey] === sig.direction;
+    const interval = sameDir ? BT_SEGMENT_INTERVAL : BT_RECORD_INTERVAL;
+    if (nowSec - (state[lastKey] || 0) < interval) continue;
+    state[lastKey] = nowSec;
+    state[lastDirKey] = sig.direction;
+    // V2 记录 ATR 止损幅度；DV 记录固定点值止损幅度(3000点→百分比)，供回测止损记账
+    let stopPct = null;
+    if (tag === 'v2' && sig.atrPct) {
+      stopPct = Math.min(V2_STOP_MAX_PCT, Math.max(V2_STOP_MIN_PCT, sig.atrPct * V2_STOP_MULT));
+    } else if (tag === 'dv' && sig.atrPct) {
+      stopPct = (DV.slPoints / newPrice) * 100;
+    }
+    await recordSignal(env, sig, newPrice, now, tag, stopPct);
+  }
+
   // 回填回测记录（用最新价格更新已达 1h/6h/24h 的窗口）
   await backfillBacktest(env, newPrice, now);
 
-  await saveState(env, state);
+  await saveState(env, state, stateDirty);
   return state;
 }
 
