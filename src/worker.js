@@ -1745,40 +1745,52 @@ export default {
     // API: 获取完整状态
     if (path === '/api/state') {
       // 每次请求时也拉取最新价格（实时性更好）
-      const state = await fetchAndAnalyze(env);
-      return new Response(JSON.stringify({
-        price: state.price,
-        high_24h: state.high_24h,
-        low_24h: state.low_24h,
-        h24_points: (state.h24 || []).length,
-        h24_ready: (state.h24 || []).length > 0
-          && (Date.now() - state.h24[0].t) >= 23 * 60 * 60 * 1000, // 窗口是否已覆盖近24H
-        h24_span_hours: (state.h24 || []).length
-          ? +((Date.now() - state.h24[0].t) / 3600000).toFixed(1) : 0,
-        hl_source: state.hl_source || null,
-        local_high_24h: state.local_high_24h ?? null,
-        local_low_24h: state.local_low_24h ?? null,
-        source_name: state.source_name || null,
-        probe: state.probe || [],
-        change_24h: state.change_24h,
-        volume_24h: state.vol,
-        market_cap: state.mcap,
-        signal: state.signal,
-        signal_v1: state.signal_v1 || null,
-        signal_v2: state.signal_v2 || null,
-        signal_dv: state.signal_dv || null,
-        active_strategy: state.active_strategy || 'v1',
-        klines_count: (state.klines || []).length,
-        prices: state.prices,
-        history: state.history || [],
-        data_points: state.prices.length,
-        update_count: state.update_count || 0,
-        last_update: state.last_update,
-        source: 'Cloudflare Worker',
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders },
-      });
+      try {
+        const state = await fetchAndAnalyze(env);
+        return new Response(JSON.stringify({
+          price: state.price,
+          high_24h: state.high_24h,
+          low_24h: state.low_24h,
+          h24_points: (state.h24 || []).length,
+          h24_ready: (state.h24 || []).length > 0
+            && (Date.now() - state.h24[0].t) >= 23 * 60 * 60 * 1000, // 窗口是否已覆盖近24H
+          h24_span_hours: (state.h24 || []).length
+            ? +((Date.now() - state.h24[0].t) / 3600000).toFixed(1) : 0,
+          hl_source: state.hl_source || null,
+          local_high_24h: state.local_high_24h ?? null,
+          local_low_24h: state.local_low_24h ?? null,
+          source_name: state.source_name || null,
+          probe: state.probe || [],
+          change_24h: state.change_24h,
+          volume_24h: state.vol,
+          market_cap: state.mcap,
+          signal: state.signal,
+          signal_v1: state.signal_v1 || null,
+          signal_v2: state.signal_v2 || null,
+          signal_dv: state.signal_dv || null,
+          active_strategy: state.active_strategy || 'v1',
+          klines_count: (state.klines || []).length,
+          prices: state.prices,
+          history: state.history || [],
+          data_points: state.prices.length,
+          update_count: state.update_count || 0,
+          last_update: state.last_update,
+          source: 'Cloudflare Worker',
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders },
+        });
+      } catch (e) {
+        // 【临时诊断】把异常栈直接返回，定位 /api/state 500 根因
+        return new Response(JSON.stringify({
+          diag: true,
+          error: String(e && e.message || e),
+          stack: String(e && e.stack || e).split('\n').slice(0, 12),
+        }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders },
+        });
+      }
     }
 
     // API: 健康检查
