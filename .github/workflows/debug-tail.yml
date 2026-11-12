@@ -16,9 +16,13 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Tail worker logs (100s)
+      - name: Tail worker logs (110s)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          timeout 100 npx --yes wrangler@3 tail --format=json 2>&1 | head -100 || true
+          timeout 110 npx --yes wrangler@3 tail --format=json > /tmp/tail.log 2>&1 || true
+          echo "=== events: $(grep -c '"outcome"' /tmp/tail.log) ==="
+          grep -c '"exceptions": \[\]' /tmp/tail.log || true
+          echo "=== exceptions ==="
+          grep -A 30 '"exceptions": \[$' /tmp/tail.log | head -80 || echo "no exceptions found"
